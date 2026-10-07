@@ -1,0 +1,488 @@
+# =====================================================================
+# NOJA OSM Auto Recloser - Phase 1: real-time data getter, V1-V42, Health Index
+# Every tunable value lives here. Environment variables override the DB URL
+# and paths (see .env.example) so the same file works locally and in the cloud.
+# Manual references: NOJA-5002-14 OSM User Manual (firmware 1.22).
+# =====================================================================
+
+seed: 20261005               # global random seed (same seed + config => identical data)
+timezone: Asia/Colombo       # local time for daily/weekly patterns
+interval_minutes: 15         # collection interval (do not change after seeding)
+default_backfill_days: 730   # seed start = now - this many days (2 years for ML training)
+
+# ---------------------------------------------------------------------
+# Fleet
+# ---------------------------------------------------------------------
+fleet:
+  n_assets: 100
+  model_mix: {OSM15-310: 0.6, OSM27-310: 0.4}
+  coastal_fraction: 0.50           # LECO serves the coastal belt
+  coastal_distance_km: [0.2, 5.0]  # distance to the sea of "coastal" reclosers
+  inland_distance_km: [5.5, 15.0]  # distance to the sea of the others
+  age_years: [0.2, 15.0]           # switchgear age at simulation start
+  fibre_fraction: 0.15
+  rs485_fraction: 0.20
+  position_load_factor: [0.3, 1.0] # share of the feeder peak seen by this recloser
+  external_load_time_min:          # UPS "External Load Time" (manual 4.8.3, default 120)
+    values: [120, 480, 1440]
+    weights: [0.6, 0.25, 0.15]
+  profiles:                        # hidden; written to output/asset_profiles.csv only
+    weights:
+      HEALTHY: 0.30
+      BATTERY_DEGRADING: 0.20
+      MECHANISM_WEAR: 0.15
+      COMMS_PROBLEM: 0.15
+      CONTROLLER_PROBLEM: 0.10
+      HARSH_ENVIRONMENT: 0.10
+    secondary_probability: 0.25
+    onset_window_days: [10, 500]   # degradation onset after simulation start
+    weak_coverage_share: 0.3       # COMMS_PROBLEM assets with a permanently weak site
+
+models:
+  OSM15-310:
+    rated_voltage_kv: 15.5
+    system_voltage_kv: 11.0
+    rated_continuous_a: 800
+    rated_break_ka: 16.0
+    rated_fault_break_ops: 70      # manual 2.1.4: 70 operations at 16 kA
+    rated_mech_ops: 30000
+    prospective_fault_ka: [3.0, 12.0]
+    serial_code: 1
+  OSM27-310:
+    rated_voltage_kv: 27.0
+    system_voltage_kv: 22.0
+    rated_continuous_a: 800
+    rated_break_ka: 12.5
+    rated_fault_break_ops: 140     # manual 2.1.4: 140 operations at 12.5 kA
+    rated_mech_ops: 30000
+    prospective_fault_ka: [2.0, 9.0]
+    serial_code: 2
+
+# Areas share weather and upstream grid outages (Sri Lanka-like).
+# LECO (Lanka Electricity Company) branches along the western / southern coastal belt.
+# anchor = approximate branch-area position [lat, lon]; spread_km = how far along the
+# coast its reclosers spread. Edit names/positions here if LECO's branch list changes.
+areas:
+  - {name: Negombo,  monsoon: SW, coastal: true, temp_offset_c: 0.2, diurnal_amp_c: 3.6, anchor: [7.209, 79.838], spread_km: 6}
+  - {name: Kelaniya, monsoon: SW, coastal: true, temp_offset_c: 0.4, diurnal_amp_c: 3.9, anchor: [6.955, 79.922], spread_km: 4}
+  - {name: Kotte,    monsoon: SW, coastal: true, temp_offset_c: 0.4, diurnal_amp_c: 3.9, anchor: [6.890, 79.902], spread_km: 3}
+  - {name: Nugegoda, monsoon: SW, coastal: true, temp_offset_c: 0.3, diurnal_amp_c: 3.8, anchor: [6.865, 79.889], spread_km: 3}
+  - {name: Moratuwa, monsoon: SW, coastal: true, temp_offset_c: 0.1, diurnal_amp_c: 3.5, anchor: [6.773, 79.882], spread_km: 5}
+  - {name: Kalutara, monsoon: SW, coastal: true, temp_offset_c: 0.0, diurnal_amp_c: 3.5, anchor: [6.583, 79.960], spread_km: 7}
+  - {name: Galle,    monsoon: SW, coastal: true, temp_offset_c: 0.1, diurnal_amp_c: 3.4, anchor: [6.053, 80.221], spread_km: 8}
+feeders_per_area: 3
+
+# ---------------------------------------------------------------------
+# Climate (monthly tables, January..December)
+# ---------------------------------------------------------------------
+climate:
+  mean_temp_c: [26.8, 27.3, 28.2, 28.7, 28.6, 28.0, 27.7, 27.7, 27.7, 27.2, 26.8, 26.6]
+  base_humidity_pct: [74, 72, 73, 77, 80, 80, 79, 78, 78, 81, 82, 78]
+  rain_hour_fraction:
+    SW: [0.08, 0.07, 0.10, 0.18, 0.28, 0.26, 0.20, 0.20, 0.24, 0.30, 0.28, 0.14]
+    NE: [0.20, 0.10, 0.06, 0.12, 0.08, 0.04, 0.04, 0.05, 0.08, 0.22, 0.32, 0.30]
+  storm_share_of_rain: [0.08, 0.08, 0.25, 0.30, 0.12, 0.08, 0.08, 0.08, 0.10, 0.28, 0.25, 0.10]
+  storm_afternoon_boost: 2.5       # 14:00-19:00 local
+  cloudy_share_of_dry: 0.35
+  weather_persistence: 0.70        # hourly probability to keep the current weather
+  temp_delta_c: {SUNNY: 0.0, CLOUDY: -1.0, RAINY: -2.5, STORM: -4.0}
+  humidity_delta_pct: {SUNNY: 0, CLOUDY: 4, RAINY: 12, STORM: 15}
+  sun_factor: {SUNNY: 1.0, CLOUDY: 0.5, RAINY: 0.15, STORM: 0.05}
+  lightning_per_interval: {SUNNY: 0.0, CLOUDY: 0.0, RAINY: 0.2, STORM: 6.0}
+  temp_noise_c: 0.4
+
+# ---------------------------------------------------------------------
+# Network load
+# ---------------------------------------------------------------------
+load:
+  feeder_peak_a: [150, 600]
+  feeder_types: {RESIDENTIAL: 0.4, COMMERCIAL: 0.2, INDUSTRIAL: 0.15, MIXED: 0.25}
+  weekend_factor:                  # [Saturday, Sunday]
+    RESIDENTIAL: [1.05, 1.08]
+    COMMERCIAL: [0.70, 0.55]
+    INDUSTRIAL: [0.80, 0.60]
+    MIXED: [0.88, 0.80]
+  temp_coeff_per_c: 0.015          # +1.5 % per degree above 28 C (air conditioning)
+  noise_ar: 0.9
+  noise_sigma: 0.025
+  phase_imbalance_sigma: 0.04
+  phase_noise_sigma: 0.01
+  voltage_feeder_offset: [-0.02, 0.02]
+  voltage_load_drop: 0.025
+  voltage_noise: 0.003
+  frequency_hz: 50.0
+  frequency_sigma: 0.015
+  leakage_a_at_full_pollution: 3.0
+
+# ---------------------------------------------------------------------
+# Supply outages
+# ---------------------------------------------------------------------
+outages:
+  area_rate_per_year: 18
+  area_weather_mult: {SUNNY: 0.5, CLOUDY: 0.8, RAINY: 2.0, STORM: 10.0}
+  area_duration_median_min: 45
+  area_duration_sigma: 1.1
+  area_duration_cap_h: 24
+  local_aux_rate_per_year: 2.0     # VT fuse / MCB trip: aux AC lost, line live
+  local_aux_duration_median_h: 14
+  local_aux_duration_sigma: 0.9
+  local_aux_duration_cap_h: 96
+  surge_prob_per_storm_interval: 0.01
+  surge_duration_s: [1, 20]
+  upstream_isolation_h: [2, 6]     # crew isolates a recloser that failed to trip
+
+# ---------------------------------------------------------------------
+# Battery and UPS (manual 4.8, 2.2.11)
+# ---------------------------------------------------------------------
+battery:
+  rated_ah: 26.0
+  models:
+    BAT-14: {service_interval_years: 2}
+    BAT-11: {service_interval_years: 4}
+  model_mix: {BAT-14: 0.6, BAT-11: 0.4}
+  replacement_model_mix: {BAT-14: 0.4, BAT-11: 0.6}
+  gel_fraction: 0.15
+  initial_age_fraction_of_interval: [0.0, 0.9]
+  initial_temp_age_factor: 1.6     # tropical cubicles age batteries ~1.6x faster than 25 C
+  capacity_tolerance_sigma: 0.03
+  r0_ohm: 0.012
+  r_soh_exponent: 2.5              # R_int = r0 / SOH^2.5
+  calendar_fade_coeff: 0.12        # SOH = 1 - coeff * (equivalent age / service interval)^2
+  temp_doubling_c: 10.0            # life halves per +10 C above 25 C
+  cycle_fade_per_full_dod: 0.001
+  cycle_fade_exponent: 1.3
+  deep_discharge_penalty: 0.02
+  degrading_extra_fade_per_day: [0.0015, 0.0030]
+  shorted_cell_prob_per_day: 0.004 # BATTERY_DEGRADING, once SOH < 0.6
+  shorted_cell_ocv_drop_v: 2.1
+  charge_current_max_a: 2.6        # 0.1 C
+  charge_taper: 1.2                # A per Ah of missing charge
+  float_current_a: 0.06
+  float_current_aging_a: 0.30
+  float_voltage_25c: 13.70
+  bulk_voltage_boost: 0.40
+  temp_comp_v_per_c: -0.018
+  controller_load_a: [0.18, 0.25]  # ~120 h autonomy without comms (manual 2.2.1)
+  external_load_a: [0.25, 0.50]    # radio/modem on the 12 V external supply
+  parasitic_off_a: 0.002
+  self_discharge_per_day: 0.001
+  charge_efficiency: 0.90
+  shutdown_level_pct: 20           # UPS "Battery Shutdown Level" default
+  power_down_v: 10.5               # manual 4.8.4.1
+  shutdown_v: 9.6
+  standby_to_powerdown_min: 5
+  boot_time_s: 90
+  status_abnormal_low_v: 11.8
+  status_abnormal_clear_v: 12.3
+  charge_pct_noise: 1.5
+  substep_minutes: 5
+  test:
+    auto_enabled: true
+    interval_days: 30              # UPS auto test "Time Interval (days)"
+    load_a: 10.0
+    duration_s: 30
+    min_voltage_v: 12.5            # "Battery Test Not Performed" below this (manual 4.8.2)
+    fail_below_v: 12.0
+    surface_charge_v: 0.15
+    polarization_v: [0.08, 0.40]   # [new battery, extra at SOH 0]
+    noise_v: 0.04
+  failed_tests_for_failure: 2
+  shutdown_failure_autonomy_fraction: 0.5
+
+# ---------------------------------------------------------------------
+# Protection and auto-reclose (manual 6.1-6.2; factory AR map R-R-L)
+# ---------------------------------------------------------------------
+protection:
+  fault_rate_per_year: 10.0
+  weather_mult: {SUNNY: 1.0, CLOUDY: 1.2, RAINY: 2.5, STORM: 12.0}
+  coastal_mult: 1.3
+  exposure_range: [0.6, 1.8]
+  type_share: {OC: 0.55, EF: 0.28, SEF: 0.05, NPS: 0.04, UV: 0.04, OV: 0.01, UF: 0.02, OF: 0.01}
+  oc_phase_sets: {AB: 0.35, BC: 0.25, CA: 0.25, ABC: 0.15}
+  permanent_prob: 0.20
+  permanent_prob_storm: 0.30
+  temp_clear_after_first: 0.80
+  temp_clear_after_second: 0.70
+  trips_to_lockout: 3
+  reclose_times_s: [10.0, 20.0, 20.0]
+  oc_pickup_factor: 1.6            # OC pickup = factor x recloser peak load (min 300 A)
+  ef_pickup_a: [40, 80]
+  tm_by_trip: [0.05, 0.25, 0.25]   # IEC standard inverse time multipliers
+  min_relay_time_s: 0.02
+  sef_pickup_a: 15
+  sef_time_s: 10.0
+  definite_time_s: {NPS: 5.0, UV: 10.0, OV: 10.0, UF: 10.0, OF: 10.0}
+  fault_current_median_frac: 0.35
+  fault_current_sigma: 0.6
+  ef_current_ka: [0.3, 3.0]
+  sef_current_a: [16, 60]
+  nps_current_a: [150, 600]
+  pollution_growth_per_day: {coastal: 0.004, inland: 0.0005}
+  pollution_wash: {RAINY: 0.995, STORM: 0.97}
+  pollution_flashover_gain: 4.0
+  restore_median_h: 3.0
+  restore_sigma: 0.7
+
+switching:
+  open_time_ms: [20, 30]           # manual 2.1.2: opening time < 30 ms
+  close_time_ms: [40, 60]          # manual 2.1.2: closing time < 60 ms (OSM15/27)
+  time_jitter: 0.04
+  excessive_to_ms: 60
+  excessive_tc_ms: 100
+  open_wear_coeff: 1.3             # To = base * (1 + coeff * mech_deg^2)
+  close_wear_coeff: 1.0
+  fail_base_prob: 0.0002
+  fail_gain: 0.25                  # + gain * max(0, deg - 0.8)^1.5
+  manual_ops_per_year: 14
+  manual_close_median_h: 2.0
+  manual_close_sigma: 0.8
+  manual_sources: {HMI: 0.45, SCADA: 0.40, CMS: 0.12, IO: 0.03}
+  mech_trip_per_year: 0.4
+  mech_deg_per_op: 0.002
+  mech_deg_initial_per_year: 0.02
+  mech_deg_growth_per_day: [0.0033, 0.0083]
+  mech_failure_deg: 1.25
+  initial_ops_per_year: [25, 70]
+  initial_contact_wear_per_year: [1.0, 6.5]
+  initial_contact_wear_cap: 92.0
+
+# ---------------------------------------------------------------------
+# Communications
+# ---------------------------------------------------------------------
+comms:
+  mobile_signal_dbm: [-105, -55]
+  weak_coverage_dbm: [-110, -100]
+  fibre_rx_dbm: [-22, -12]
+  signal_noise_db: {MOBILE: 2.0, FIBRE: 0.3}
+  rain_fade_db: {SUNNY: 0, CLOUDY: 0, RAINY: -3, STORM: -7}
+  deg_signal_loss_db: 8.0
+  disconnect_prob_per_interval: {MOBILE: 0.0008, FIBRE: 0.0001}
+  weak_signal_knee_dbm: -85
+  weak_signal_scale_db: 8.7
+  weather_mult: {SUNNY: 1.0, CLOUDY: 1.0, RAINY: 1.5, STORM: 3.0}
+  deg_mult: 8.0
+  reconnect_median_min: 4.0
+  reconnect_sigma: 1.3
+  watchdog_restart_after_min: 20
+  modem_boot_min: [1.0, 3.0]
+  comms_deg_growth_per_day: [0.0042, 0.011]
+  rs485_errors_per_month: 0.5
+  rs485_burst: [1, 5]
+  comms_failure_disconnected_h: 12
+
+# ---------------------------------------------------------------------
+# Controller (RC) malfunctions - base rates per asset per year (Appendix F names)
+# ---------------------------------------------------------------------
+controller:
+  malfunction_rates_per_year:
+    SIM Module Fault: 0.15
+    Relay Module Fault: 0.10
+    Panel Module Fault: 0.10
+    I/O1 Fault: 0.08
+    RTC Hardware Fault: 0.04
+    CAN Bus Malfunction: 0.25
+    Module Comms Error: 0.25
+    SIM Comms Error: 0.15
+    Panel Comms Error: 0.20
+    I/O1 Comms Error: 0.10
+    GPS Malfunction: 0.10          # REL-15 relays only
+    Capacitor Voltage Abnormal: 0.05
+    External Load Overload: 0.08
+    USB Overcurrent: 0.03
+    Battery Charger Fault: 0.06
+  persistent_signals: [SIM Module Fault, Relay Module Fault, CAN Bus Malfunction]
+  duration_median_s: 90
+  duration_sigma: 1.5
+  deg_gain: 25.0
+  harsh_humidity_mult: 2.0
+  coastal_mult: 1.3
+  ctrl_deg_growth_per_day: [0.0033, 0.0083]
+  ext_overload_restore_h: [4, 30]
+  charger_fault_failure_h: 24
+
+# ---------------------------------------------------------------------
+# Maintenance and failures
+# ---------------------------------------------------------------------
+maintenance:
+  preventive_interval_days: 365
+  preventive_jitter_days: 30
+  initial_last_maintenance_months: [0, 18]
+  battery_replace_compliance: 0.70
+  firmware_upgrade_prob: 0.30
+  pm_test_operations: 2
+  corrective_delay_days:
+    BATTERY: [1, 14]
+    MECHANISM: [1, 10]
+    CONTACTS: [3, 21]
+    COMMS: [1, 7]
+    CONTROLLER: [1, 10]
+  osm_replacement_hours: [2, 4]
+  work_hours_local: [8, 17]
+  next_onset_mean_years:
+    BATTERY_DEGRADING: 5
+    MECHANISM_WEAR: 8
+    COMMS_PROBLEM: 4
+    CONTROLLER_PROBLEM: 6
+
+firmware_releases:                 # manual revision history; append newer releases here
+  - {version: "1.8.0",  release_date: 2013-11-11}
+  - {version: "1.9.0",  release_date: 2014-01-06}
+  - {version: "1.10.0", release_date: 2014-02-20}
+  - {version: "1.12.0", release_date: 2014-11-01}
+  - {version: "1.13.0", release_date: 2015-03-30}
+  - {version: "1.14.0", release_date: 2015-10-19}
+  - {version: "1.15.0", release_date: 2016-02-19}
+  - {version: "1.16.0", release_date: 2016-09-13}
+  - {version: "1.17.0", release_date: 2017-02-24}
+  - {version: "1.18.0", release_date: 2017-03-27}
+  - {version: "1.19.0", release_date: 2017-08-18}
+  - {version: "1.20.0", release_date: 2018-01-10}
+  - {version: "1.21.0", release_date: 2018-08-31}
+  - {version: "1.22.0", release_date: 2018-12-10}
+firmware_upgrade_at_seed_prob: 0.4
+
+# ---------------------------------------------------------------------
+# V1-V42 final data (table ar_variables_15min, every 15 min)
+# Column suffixes (_24h, _30d) reflect these defaults.
+# ---------------------------------------------------------------------
+variables:
+  short_window_hours: 24
+  long_window_days: 30
+  discharge_current_a: -0.05
+  soh_min_delta_pct: 8
+  soh_ref_resistance_ohm: 0.035    # apparent test resistance of a new battery
+  soh_resistance_exponent: 0.58    # SOH_est = 100 * (R_ref / R_apparent)^exponent
+  soh_new_battery_days: 60         # V3 = 100 for a battery younger than this with no evidence
+  calc_chunk_days: 20
+  ac_off_signal: AC Off (On Battery Supply)
+  battery_alarm_signals: [Battery Status Abnormal, Check Battery, Critical Battery Level,
+                          Battery Off (On AC Supply), Battery Charger Fault]
+  module_fault_signals: [SIM Module Fault, Relay Module Fault, Panel Module Fault, I/O1 Fault,
+                         RTC Hardware Fault, CAN Bus Malfunction, Module Comms Error, SIM Comms Error,
+                         Panel Comms Error, I/O1 Comms Error, GPS Malfunction]
+  switching_fail_signals: [Trip Request Fail, Close Request Fail, Excessive To, Excessive Tc]
+
+# ---------------------------------------------------------------------
+# Health Index mathematical model (table ar_health_index_15min)
+#   s_i = 100 * clamp((bad - x) / (bad - good), 0, 1)
+#   F_k = sum(w_i s_i) / sum(w_i) over available variables of factor k
+#   HI  = sum_k W_k F_k / 100,  W_k = sum of the factor's weights (= your %)
+# ---------------------------------------------------------------------
+health_index:
+  factors:
+    BATTERY:     [v01, v02, v03, v04, v05, v06, v07, v08, v09, v10]
+    FAULTS:      [v11, v12, v13, v14, v15, v16, v17, v18, v19, v20]
+    SWITCHING:   [v21, v22, v23, v24, v25, v26, v27]
+    COMMS:       [v28, v29, v30, v31, v32]
+    CONTROLLING: [v33, v34, v35, v36]
+    AGING:       [v37, v38, v39]
+    ENVIRONMENT: [v40, v41, v42]
+  weights:                         # your Excel weightages (sum = 100)
+    v01: 3.0
+    v02: 1.5
+    v03: 3.0
+    v04: 1.5
+    v05: 2.0
+    v06: 1.5
+    v07: 3.0
+    v08: 1.5
+    v09: 2.0
+    v10: 1.0
+    v11: 6.0
+    v12: 1.5
+    v13: 3.0
+    v14: 1.5
+    v15: 2.0
+    v16: 1.5
+    v17: 2.0
+    v18: 2.5
+    v19: 2.0
+    v20: 2.0
+    v21: 3.0
+    v22: 1.0
+    v23: 1.0
+    v24: 4.0
+    v25: 3.0
+    v26: 3.0
+    v27: 5.0
+    v28: 3.0
+    v29: 2.0
+    v30: 2.0
+    v31: 1.0
+    v32: 2.0
+    v33: 5.0
+    v34: 5.0
+    v35: 2.0
+    v36: 1.0
+    v37: 1.5
+    v38: 2.5
+    v39: 4.0
+    v40: 2.0
+    v41: 2.0
+    v42: 1.0
+  thresholds:                      # good -> score 100, bad -> score 0 (linear between)
+    v01: {band: [12.6, 14.4], bad: [11.6, 14.8]}
+    v02: {good: 0, bad: 4}
+    v03: {good: 90, bad: 50}
+    v04: {good: 50, bad: 120}
+    v05: {good: 0, bad: 10}
+    v06: {good: 20, bad: 80}
+    v07: {good: 0, bad: 5}
+    v08: {good: 1, bad: 4}
+    v09: {good: 0, bad: 2}
+    v10: {good: 60, bad: 2880}
+    v11: {good: 20, bad: 100}
+    v12: {good: 0, bad: 5}
+    v13: {good: 0, bad: 4}
+    v14: {good: 2, bad: 15}
+    v15: {good: 0, bad: 8}
+    v16: {good: 0, bad: 4}
+    v17: {good: 0, bad: 8}
+    v18: {good_frac_rated: 0.20, bad_frac_rated: 0.80}
+    v19: {good: 0, bad: 4}
+    v20: {good: 0, bad: 4}
+    v21: {good_frac_mech: 0.10, bad_frac_mech: 1.0}
+    v22: {good: 10, bad: 60}
+    v23: {good: 10, bad: 60}
+    v24: {good: 3, bad: 25}
+    v25: {good: 3, bad: 20}
+    v26: {good: 2, bad: 15}
+    v27: {good: 0, bad: 3}
+    v28: {good: 99, bad: 80}
+    v29: {good: 0, bad: 10}
+    v30: {good: 0, bad: 10}
+    v31: {MOBILE: {good: -75, bad: -105}, FIBRE: {good: -18, bad: -27}}
+    v32: {good: 1, bad: 10}
+    v33: {good: 0, bad: 3}
+    v34: {good: 3, bad: 30}
+    v35: {good: 0, bad: 6}
+    v36: {good: 0, bad: 20}
+    v37: {good: 5, bad: 30}        # 30-year design life (manual 3.1)
+    v38: {good: 5, bad: 30}
+    v39: {good: 365, bad: 1095}
+    v40: {good: 30, bad: 45}
+    v41: {map: {"0": 100, "1": 40}}
+    v42: {map: {SUNNY: 100, CLOUDY: 90, RAINY: 60, STORM: 20}}
+  caps:                            # a critical sub-score of 0 caps the HI
+    v27: 45
+    v11: 40
+    v03: 50
+    v09: 50
+    v33: 55
+  classes: {GOOD: 80, FAIR: 60, POOR: 40, CRITICAL: 0}
+  healthy_min: 60
+  worst_n: 3
+
+# ---------------------------------------------------------------------
+# Database / output
+# ---------------------------------------------------------------------
+db:
+  default_url: sqlite:///data/ar_maintenance.sqlite
+  batch_size: 5000
+  retries: 5
+paths:
+  state_dir: state
+  output_dir: output
+  log_dir: logs
+  models_dir: models               # ML model trained in Google Colab (ml_meta.json + LightGBM files)
+ground_truth_daily: true

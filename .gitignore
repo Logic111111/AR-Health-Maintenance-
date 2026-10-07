@@ -1,0 +1,17 @@
+# secrets - copy .env.example to .env locally
+.env
+
+# generated / runtime data (large; recreate with init-db, seed, backfill, generate-ml-data)
+data/
+output/
+state/
+logs/
+
+# Python / tools
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+.vscode/

@@ -1,0 +1,11 @@
+pandas>=2.0
+numpy>=1.24
+SQLAlchemy>=2.0,<2.1
+PyMySQL>=1.1
+APScheduler>=3.10,<4
+python-dotenv>=1.0
+PyYAML>=6.0
+tzdata
+pytest>=7.0
+streamlit>=1.37
+lightgbm>=4.0
