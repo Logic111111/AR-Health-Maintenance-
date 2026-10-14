@@ -109,7 +109,7 @@ def test_status_follows_the_configured_hi_classes():
     assert status_of(0, False, "CLOSED", 49, classes) == "CRITICAL"
 
 
-def test_ml_values_older_than_the_health_index_are_not_shown_as_current(db):
+def test_ml_values_older_than_the_health_index_are_not_shown_as_current(ml_on, db):
     import shutil
 
     from ar_gen.dashboard_data import model_status

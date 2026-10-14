@@ -12,7 +12,12 @@ The fleet is **100 NOJA reclosers across 7 LECO branches**: Negombo, Kelaniya, K
 On top of that:
 - a **futuristic 3D dashboard** (`python main.py dashboard`) shows the fleet live;
 - **maintenance resets** restart the repaired part's Health Index;
-- a **machine-learning model trained in Google Colab** adds a failure-risk prediction next to the HI every 15 minutes (`docs/ML_COLAB_GUIDE.md`).
+- a **Windows service** keeps the real-time data generation running in the background, from boot (section 5);
+- **machine learning is switched off for now** (`config.yaml` → `ml: enabled: false`), so the collector and the
+  dashboard show the Health Index only. The models stay in the project, and one setting turns them back on
+  (section 7):
+  - a **LightGBM model trained in Google Colab** (`docs/ML_COLAB_GUIDE.md`);
+  - a **deep-learning model** (GRU / TCN / Transformer over the last 14 days, trained on a Colab GPU).
 
 The data source is a deterministic, physics-based simulator of each recloser (`SimulatedNojaSource`). A real source (DNP3 / SCADA historian / CMS log import) can replace it later through the `RecloserSource` interface (`ar_gen/sources/base.py`) without changing the variable or HI code.
 
@@ -60,8 +65,8 @@ python main.py seed --days 30   # 100 LECO reclosers, 30 days of history (hidden
 python main.py backfill         # raw -> V1-V42 -> HI -> daily summary  (about 8 min for 30 days)
 python main.py validate         # consistency checks; must print "Validation PASSED"
 python main.py status           # latest HI of every recloser
-python main.py scheduler        # keep running: updates every 15 min at :00 :15 :30 :45
-python main.py dashboard        # second terminal: the 3D command centre at http://localhost:8501
+python main.py service install # admin PowerShell, once: the real-time generator as a Windows service (section 5)
+python main.py dashboard        # the 3D command centre at http://localhost:8501
 ```
 
 The live database keeps recent data only. Old history for ML training is produced separately with
@@ -88,12 +93,14 @@ Everything continues from there. If the configured database does not contain the
 | `seed [--assets N] [--start YYYY-MM-DD \| --days N]` | create the fleet and its hidden degradation profiles |
 | `backfill [--end DATE] [--no-compute]` | generate history up to now (or `--end`), committed per day, then V1–V42 and HI |
 | `run-once` | collect the interval(s) that just ended, then update V1–V42 and HI. Missed intervals are filled automatically |
-| `scheduler` | run-once at :00, :15, :30 and :45 (APScheduler); catches up on start |
+| `service install \| start \| stop \| restart \| status \| remove` | the real-time generator as a Windows service (section 5). All but `status` need an admin PowerShell |
+| `package-service [--out DIR]` | zip of **just the generator service** to send to someone: `dist/LECO_AR_Generator_Service_<date>.zip` (no dashboard, ML, notebooks or data), with install steps in its README |
+| `service run` (alias `scheduler`) | the real-time generator in this console: updates at :00, :15, :30 and :45 (+10 s), catches up on start; Ctrl+C stops it |
 | `status` | latest HI, class, healthy flag, worst variables and factor scores per recloser |
 | `dashboard [--port 8501] [--lan]` | open the **3D recloser health map** in your browser (section 5b). It listens on this PC only; `--lan` also allows other computers on your network, and anyone there can save resets |
 | `maintenance-done --asset AR-008 --part SWITCHING [--part ...] [--at "YYYY-MM-DD HH:MM"] [--note ...]` | record maintenance and reset the repaired part's Health Index, then recalculate. Parts: BATTERY, SWITCHING, COMMS, CONTROLLER, ALL; `--at` is local time, default the latest interval; any time up to now is accepted |
-| `ml-status` | shows whether a trained ML model is installed in `models/` (version, alarm level, test results) |
-| `ml-score [--start --end]` | scores stored V1–V42 rows with the installed model (once after installing a model; the collector then scores every 15 min) |
+| `ml-status`, `dl-status` | whether a trained LightGBM / deep-learning model is installed (version, alarm level, test results). Only while ML is switched on (section 7) |
+| `ml-score`, `dl-score [--start --end]` | score stored V1–V42 rows with the installed model. Only while ML is switched on |
 | `prune-history [--keep-days 30] [--backup FILE \| --no-backup]` | deletes older data, after a full backup by default, and keeps what the 30-day calculations still need |
 | `set-locations --csv file.csv` | load real GPS positions (`asset_id,latitude,longitude`), replacing the simulated ones |
 | `validate` | gaps, ranges, counters vs operations, fault ↔ operation sequences, alarm pairing, repairs, coverage, and HI before failures |
@@ -103,26 +110,53 @@ Everything continues from there. If the configured database does not contain the
 | `copy-db --from URL` | copy all data from another database into `DATABASE_URL` |
 | `generate-ml-data [--assets 100] [--days 730] [--seed N]` | generate an ML training dataset **directly, without the database**: a separate simulated fleet, written to `output/ml_generated/` |
 
-Logs go to the console and to `logs/ar_gen.log` (rotating). A lock file (`state/ar_gen.lock`) stops two runs from overlapping, for example the scheduler and Task Scheduler.
+Logs go to the console and to `logs/ar_gen.log` (rotating); the Windows service writes `logs/ar_service.log`. A lock file (`state/ar_gen.lock`) stops two runs from overlapping, for example the service and a manual `run-once`.
 
-## 5. Real-time operation every 15 minutes
+## 5. Real-time data generator service
 
-**Option A: keep `python main.py scheduler` running** in a terminal or as a service.
+The real-time generator collects every interval and updates V1–V42 and the Health Index:
+- It runs 10 s after :00, :15, :30 and :45.
+- After downtime it first catches up, one day per step, so the data stays continuous.
 
-**Option B: Windows Task Scheduler running `run-once`.** Run this once in an elevated PowerShell:
+On Windows it runs as the service **LECO AR Data Generator** (`LecoArDataGenerator`):
+- it starts at boot without anyone logged in (delayed automatic start, so MariaDB is up first);
+- Windows restarts it 60 s after a crash;
+- it keeps generating after the PowerShell window is closed.
+
+**Install it once in an admin PowerShell** (Start menu → right-click *Windows PowerShell* → *Run as administrator*):
 
 ```powershell
-schtasks /Create /TN "AR data getter" /SC MINUTE /MO 15 /ST 00:00 /F `
-  /TR "\"C:\Python313\python.exe\" \"D:\AR Preventive Analyze\main.py\" run-once"
+cd "D:\AR Preventive Analyze"
+python main.py service install     # test start, register, start now
+python main.py service status      # Windows service state + the generator's last run (any PowerShell)
 ```
 
-- In the Task Scheduler GUI, open the task's properties and set **Run whether user is logged on or not** and **Do not start a new instance** (Settings tab).
-- Check that it works: `schtasks /Run /TN "AR data getter"`, then look at `logs\ar_gen.log`.
-- Remove the task with `schtasks /Delete /TN "AR data getter" /F`.
+Before registering, `install` makes a test start of the service exactly as Windows will run it.
 
-Use `where python` to find your Python path. The working directory does not matter; paths resolve from the project folder.
+| command | what it does |
+|---|---|
+| `service install [--no-start]` | register (or update) and start the service. Run it again after moving the project folder or Python |
+| `service start` / `stop` / `restart` | control it, as in `services.msc`. A stop waits for the update step that is running |
+| `service status` | `RUNNING` / `STOPPED` / `NOT INSTALLED`, plus the generator's last run, data time, errors and next run (from `state/generator_status.json`) |
+| `service remove` | stop and unregister it |
+| `service run` | run the generator in this console instead (no admin needed); Ctrl+C stops it. `scheduler` is the same |
 
-If the PC was off, the next run fills every missed interval, so the data stays continuous.
+Notes:
+- **Account.** The service runs `C:\Python313\python.exe ar_service.py` as the **LocalSystem** account.
+  - Your packages (pandas, SQLAlchemy, …) are in your own user site-packages. `install` puts that folder on the
+    service's command line, so after `pip install`, reinstalling the service is not needed.
+  - The database (`.env` or SQLite), `state/` and `logs/` are the same as for your own commands.
+- **Log.** `logs\ar_service.log`. Start and stop are also written to the Windows **Event Viewer** (Windows Logs →
+  Application).
+- **Old Task Scheduler task.** If you created the "AR data getter" task from an earlier version, delete it with
+  `schtasks /Delete /TN "AR data getter" /F`. `install` reminds you. The lock file stops both from writing at the
+  same time anyway.
+- **Without the service.** Run `python main.py service run` in a terminal; it stops when the terminal closes.
+- **Other systems.** On Linux, run `python main.py service run` under systemd.
+- **Sending the service to someone:** `python main.py package-service` writes a ~110 kB zip to `dist/`. The receiver
+  unzips it and follows its `README.md` (from `docs/SERVICE_PACKAGE_README.md`): pip install, `init-db`, `seed`,
+  `backfill`, `service install`. Don't run `service install` from an unzipped copy on your own PC: it would point
+  your existing service at that copy.
 
 ## 5b. 3D dashboard and resetting the HI after maintenance
 
@@ -219,7 +253,31 @@ FROM co_operations o WHERE o.fault_id = 100 ORDER BY o.ts;
 SELECT ts, asset_id, component, maint_type, description, details FROM maintenance_log ORDER BY ts;
 ```
 
-## 7. ML dataset for Phase 2
+## 7. Machine learning (switched off for now) and the ML dataset
+
+**The ML switch.** In `config.yaml`:
+
+```yaml
+ml:
+  enabled: false
+```
+
+With `false` (the current setting):
+- the collector does no LightGBM or deep-learning scoring;
+- the dashboard has no ML tabs, gauges, columns, KPIs, map option or tooltip lines;
+- `ml-status`, `ml-score`, `dl-status` and `dl-score` only say that ML is switched off.
+
+The notebooks, the model files in `models/` and `models/dl/` and the predictions already stored are kept.
+
+To bring ML back:
+1. Set `enabled: true`.
+2. Run `python main.py service restart` (admin) and restart the dashboard.
+3. Run `python main.py ml-score` / `dl-score` once to fill the gap.
+
+The environment variable `AR_ML_ENABLED=1` / `0` overrides the setting. The switch does not change the simulated
+data.
+
+### ML dataset
 
 ```powershell
 python main.py export-dataset
@@ -252,6 +310,23 @@ Unzip it into `models/` and run `python main.py ml-score` (it scores all stored 
 
 The notebook embeds the project's feature code (`ar_gen/ml_features.py`), so training and live scoring always build the same inputs.
 
+**Deep-learning model (Colab GPU, works next to LightGBM):** `notebooks/AR_DL_Colab.ipynb`, built by
+`notebooks/build_dl_notebook.py`. The notebook:
+- reads the last 14 days of each recloser as a sequence;
+- trains GRU, TCN and Transformer networks and keeps the best;
+- compares it with LightGBM and the HI on the same test months;
+- exports `ar_dl_model.zip`.
+
+To use it:
+1. Unzip `ar_dl_model.zip` into `models/dl/`.
+2. Install PyTorch (CPU) once, if it is missing.
+3. Run `python main.py dl-status`, then `python main.py dl-score`.
+
+The collector then stores the network's risk every 15 minutes in `ar_dl_prediction_15min`. The dashboard's
+**Deep Learning** tab shows it next to LightGBM and the HI. The network code is `ar_gen/dl_model.py`, which the
+notebook embeds verbatim; scoring is `ar_gen/dl_scoring.py`. Step-by-step: the deep-learning section of
+[docs/ML_COLAB_GUIDE.md](docs/ML_COLAB_GUIDE.md).
+
 The older notebook `notebooks/AR_failure_prediction.ipynb` (with its `_results` copy) is a simpler first version, kept for reference.
 
 This writes the following files to `output/ml/`:
@@ -280,7 +355,9 @@ All settings are in `config.yaml`:
 - V1–V42 windows;
 - HI weights, thresholds, caps and classes.
 
-Environment variables override `DATABASE_URL`, `AR_CONFIG`, `AR_STATE_DIR`, `AR_OUTPUT_DIR` and `AR_LOG_DIR`, which suits cloud or container runs.
+`ml: enabled` switches the machine-learning models on or off (section 7).
+
+Environment variables override `DATABASE_URL`, `AR_CONFIG`, `AR_STATE_DIR`, `AR_OUTPUT_DIR`, `AR_LOG_DIR`, `AR_MODELS_DIR`, `AR_DL_MODELS_DIR` and `AR_ML_ENABLED`, which suits cloud or container runs.
 
 - Changing **HI** settings: run `python main.py compute-hi`.
 - Changing **variable** windows: run `python main.py compute-variables`.
@@ -309,15 +386,20 @@ The tests cover:
 - the HI model;
 - the simulator: telemetry ranges, fault ↔ operation consistency, counters vs logged operations, alarm pairing, battery failure and repair, determinism, split run = single run;
 - V1–V42 (each variable, no look-ahead, incremental = full);
-- the end-to-end pipeline: validate passes, idempotent re-run, interval-by-interval = backfill, crash recovery, copy-db.
+- the end-to-end pipeline: validate passes, idempotent re-run, interval-by-interval = backfill, crash recovery, copy-db;
+- the real-time generator (catch-up, errors, status) and the Windows service set-up (test start without your
+  user site-packages, recovery settings);
+- the ML switch: with it off, nothing ML is scored or shown even when models are installed.
 
 ## 11. Project layout
 
 ```
 main.py                     CLI entry point
+ar_service.py               Windows service host (started by Windows; use `python main.py service ...`)
 config.yaml                 every tunable value
 ar_gen/
   cli.py, pipeline.py       commands; collect -> store -> variables -> HI
+  generator.py, service.py  real-time generator loop; Windows service install / start / stop / status
   sources/                  RecloserSource interface + SimulatedNojaSource
   sim/                      simulator: fleet, environment, load, UPS/battery, protection, switching,
                             comms, controller, maintenance, engine
@@ -328,5 +410,5 @@ ar_gen/
 tests/                      pytest suite
 state/                      simulator state (hidden truth) - not in the DB
 output/                     hidden profiles, ground truth, ML exports
-logs/                       ar_gen.log
+logs/                       ar_gen.log, ar_service.log
 ```

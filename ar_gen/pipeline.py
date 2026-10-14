@@ -16,6 +16,7 @@ from pathlib import Path
 import pandas as pd
 import sqlalchemy as sa
 
+from .config import ml_enabled
 from .db import schema
 from .db.engine import create_all, drop_all, ensure_database, make_engine, with_retry
 from .db.reader import asset_frame, asset_start_ms, df_to_rows, load_inputs, read_df
@@ -170,11 +171,12 @@ def _round_frame(df: pd.DataFrame, nd: int = 4) -> pd.DataFrame:
     return df
 
 
-_LOAD = object()        # compute_range(model=...): load the installed model itself
+_LOAD = object()        # compute_range(model=..., dl_model=...): load the installed model itself
 
 
-def compute_range(cfg: dict, engine: sa.Engine, start_ms: int, end_ms: int, model=_LOAD) -> int:
-    """(Re)compute V1-V42 and the HI (and ML risk, daily summary) for interval ends in (start_ms, end_ms]."""
+def compute_range(cfg: dict, engine: sa.Engine, start_ms: int, end_ms: int, model=_LOAD, dl_model=_LOAD) -> int:
+    """(Re)compute V1-V42 and the HI (plus ML / deep-learning risk and the daily summary) for interval ends in
+    (start_ms, end_ms]."""
     step = step_ms(cfg)
     start_ms -= start_ms % step
     chunk = int(cfg["variables"]["calc_chunk_days"]) * DAY_MS
@@ -185,6 +187,8 @@ def compute_range(cfg: dict, engine: sa.Engine, start_ms: int, end_ms: int, mode
     start_ms = max(start_ms, min(a_start.values()))
     if model is _LOAD:
         model = _try_load_model(cfg)
+    if dl_model is _LOAD:
+        dl_model = _try_load_dl_model(cfg)
     retry = with_retry(cfg["db"].get("retries", 5))
     total, s, t_start = 0, start_ms, time.time()
     while s < end_ms:
@@ -199,6 +203,8 @@ def compute_range(cfg: dict, engine: sa.Engine, start_ms: int, end_ms: int, mode
         retry(_replace_calculated)(engine, s, e, v_rows, h_rows, cfg)
         if model is not None and not _score_safely(cfg, engine, s, e, model):
             model = None            # keeps the ML gap at the end, where the next run catches it up
+        if dl_model is not None and not _dl_score_safely(cfg, engine, s, e, dl_model):
+            dl_model = None         # same for the deep-learning model
         retry(update_daily_summary)(cfg, engine, s, e)
         total += len(v_rows)
         log.info("variables + HI up to %s (%d rows, %.0f s)", ms_to_dt(e), total, time.time() - t_start)
@@ -217,7 +223,9 @@ def _replace_calculated(engine, s, e, v_rows, h_rows, cfg):
 
 # ------------------------------------------------------------------ ML scoring + daily summary
 def _try_load_model(cfg: dict):
-    """The installed Colab model, or None (a broken/incompatible bundle never stops the pipeline)."""
+    """The installed Colab model, or None (ML switched off; a broken/incompatible bundle never stops the pipeline)."""
+    if not ml_enabled(cfg):
+        return None
     from .ml_scoring import load_model
     try:
         return load_model(cfg["paths"]["models_dir"])
@@ -258,6 +266,49 @@ def _ml_catch_up(cfg: dict, engine: sa.Engine, last_hi_ms: int, model):
         log.warning("ML catch-up failed (retried next run): %s", exc)
         return None
     return model
+
+
+# ------------------------------------------------------------------ deep-learning scoring (models/dl, separate)
+def _try_load_dl_model(cfg: dict):
+    """The installed deep-learning model, or None (ML switched off; a missing or broken bundle never stops the
+    pipeline)."""
+    if not ml_enabled(cfg):
+        return None
+    from .dl_scoring import load_dl_model
+    try:
+        return load_dl_model(cfg["paths"]["dl_models_dir"])
+    except Exception as exc:                           # noqa: BLE001 - report and carry on without it
+        log.warning("deep-learning model not used: %s", exc)
+        return None
+
+
+def _dl_score_safely(cfg: dict, engine: sa.Engine, start_ms: int, end_ms: int, dl_model) -> bool:
+    from .dl_scoring import score_range
+    try:
+        score_range(cfg, engine, start_ms, end_ms, dl_model)
+        return True
+    except Exception as exc:                           # noqa: BLE001 - report, HI and ML go on
+        log.warning("deep-learning scoring failed for %s - %s (the next run catches it up): %s",
+                    ms_to_dt(start_ms), ms_to_dt(end_ms), exc)
+        return False
+
+
+def _dl_catch_up(cfg: dict, engine: sa.Engine, last_hi_ms: int, dl_model):
+    """Score HI intervals an earlier run left without deep-learning scores (as _ml_catch_up).
+
+    A database never scored before is left to ``dl-score``.
+    """
+    from .dl_scoring import last_scored_ms, score_stored
+    done = last_scored_ms(engine)
+    if done is None or done >= last_hi_ms:
+        return dl_model
+    log.info("deep-learning catch-up: scoring %s - %s", ms_to_dt(done), ms_to_dt(last_hi_ms))
+    try:
+        score_stored(cfg, engine, done, last_hi_ms, dl_model)
+    except Exception as exc:                           # noqa: BLE001 - report, HI goes on
+        log.warning("deep-learning catch-up failed (retried next run): %s", exc)
+        return None
+    return dl_model
 
 
 def ml_score_range(cfg: dict, engine: sa.Engine, start_ms: int, end_ms: int, model) -> int:
@@ -303,7 +354,7 @@ def update_daily_summary(cfg: dict, engine: sa.Engine, start_ms: int, end_ms: in
     with engine.connect() as conn:
         hi_df = read_df(conn, sa.select(h.c.asset_id, h.c.ts, h.c.health_index).where(h.c.ts >= lo, h.c.ts < hi))
         ml_df = read_df(conn, sa.select(p.c.asset_id, p.c.ts, p.c.p_fail_30d, p.c.ml_healthy)
-                        .where(p.c.ts >= lo, p.c.ts < hi))
+                        .where(p.c.ts >= lo, p.c.ts < hi)) if ml_enabled(cfg) else pd.DataFrame()
     if hi_df.empty:
         return 0
     healthy_min = float(cfg["health_index"]["healthy_min"])
@@ -402,9 +453,12 @@ def compute_pending(cfg: dict, engine: sa.Engine, until_ms: int) -> int:
     model = _try_load_model(cfg)
     if model is not None:
         model = _ml_catch_up(cfg, engine, last, model)
+    dl_model = _try_load_dl_model(cfg)
+    if dl_model is not None:
+        dl_model = _dl_catch_up(cfg, engine, last, dl_model)
     if until_ms <= last:
         return 0
-    return compute_range(cfg, engine, last, until_ms, model=model)
+    return compute_range(cfg, engine, last, until_ms, model=model, dl_model=dl_model)
 
 
 # ------------------------------------------------------------------ top-level runs
@@ -571,7 +625,8 @@ def prune_history(cfg: dict, keep_days: int = 30, event_margin_days: int = 7, ba
             m, f, o = t["maintenance_log"], t["failure_log"], t["co_operations"]
             repaired = sorted({int(x) for x in conn.execute(
                 sa.select(m.c.failure_id).where(m.c.failure_id.is_not(None))).scalars()})
-            for name in ("ar_ml_prediction_15min", "ar_health_index_15min", "ar_variables_15min", "telemetry_15min"):
+            for name in ("ar_ml_prediction_15min", "ar_dl_prediction_15min", "ar_health_index_15min",
+                         "ar_variables_15min", "telemetry_15min"):
                 deleted[name] = conn.execute(t[name].delete().where(t[name].c.ts <= c_dt)).rowcount
             ds = t["ar_daily_summary"]
             deleted["ar_daily_summary"] = conn.execute(

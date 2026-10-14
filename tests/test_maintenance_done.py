@@ -16,7 +16,7 @@ START = "2025-03-01"
 def db(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'db.sqlite').as_posix()}")
     for env, sub in (("AR_STATE_DIR", "state"), ("AR_OUTPUT_DIR", "output"), ("AR_LOG_DIR", "logs"),
-                     ("AR_MODELS_DIR", "models")):
+                     ("AR_MODELS_DIR", "models"), ("AR_DL_MODELS_DIR", "models_dl")):
         monkeypatch.setenv(env, str(tmp_path / sub))
     cfg = make_cfg(3, BUSY)
     pipeline.init_db(cfg)

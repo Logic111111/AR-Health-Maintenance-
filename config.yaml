@@ -485,4 +485,13 @@ paths:
   output_dir: output
   log_dir: logs
   models_dir: models               # ML model trained in Google Colab (ml_meta.json + LightGBM files)
+  dl_models_dir: models/dl         # deep-learning model from AR_DL_Colab.ipynb (dl_meta.json + model_dl.pt)
 ground_truth_daily: true
+
+# ---------------------------------------------------------------------
+# Machine learning (LightGBM in models/, deep learning in models/dl)
+# ---------------------------------------------------------------------
+ml:
+  enabled: false     # false: no ML scoring in the collector and no ML in the dashboard or the ml-/dl- commands.
+                     # The code, notebooks, models and stored predictions are kept; true turns it all back on.
+                     # (environment variable AR_ML_ENABLED=1 / 0 overrides this)

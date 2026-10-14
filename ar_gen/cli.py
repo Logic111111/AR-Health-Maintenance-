@@ -8,7 +8,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from .config import load_config
+from .config import load_config, ml_enabled
 from .logging_setup import setup_logging
 from .sim.timeutil import dt_to_ms, local_to_ms, parse_date
 
@@ -45,7 +45,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-compute", action="store_true", help="raw data only")
 
     sub.add_parser("run-once", help="collect the interval(s) that just ended and update V1-V42 + HI")
-    sub.add_parser("scheduler", help="run-once every 15 minutes at :00 :15 :30 :45")
+    sub.add_parser("scheduler", help="real-time generator in this console (same as 'service run')")
+    s = sub.add_parser("service", help="real-time data generator as a Windows service: install, start, stop, "
+                                      "restart, status, remove; or run it in this console")
+    s.add_argument("action", choices=["install", "start", "stop", "restart", "status", "remove", "run"])
+    s.add_argument("--no-start", action="store_true", help="install: register the service but do not start it now")
+    s = sub.add_parser("package-service", help="zip of just the real-time generator service, to send to someone "
+                                              "(no dashboard, ML, notebooks or data)")
+    s.add_argument("--out", help="output folder (default: dist)")
     sub.add_parser("status", help="latest Health Index of every recloser")
     s = sub.add_parser("live", help="show the newest 15-min interval of every recloser; refreshes when new data arrives")
     s.add_argument("--once", action="store_true", help="print once and exit")
@@ -73,6 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("ml-status", help="show whether a trained ML model is installed (models folder)")
     s = sub.add_parser("ml-score", help="score stored V1-V42 rows with the installed ML model")
+    s.add_argument("--start", help="YYYY-MM-DD or ISO UTC (default: beginning)")
+    s.add_argument("--end", help="YYYY-MM-DD or ISO UTC (default: last collected)")
+
+    sub.add_parser("dl-status", help="show whether a deep-learning model is installed (models/dl folder)")
+    s = sub.add_parser("dl-score", help="score stored V1-V42 rows with the installed deep-learning model")
     s.add_argument("--start", help="YYYY-MM-DD or ISO UTC (default: beginning)")
     s.add_argument("--end", help="YYYY-MM-DD or ISO UTC (default: last collected)")
 
@@ -113,6 +125,9 @@ def main(argv: list[str] | None = None) -> int:
     except (RuntimeError, FileNotFoundError, ValueError) as exc:
         log.error("%s", exc)
         return 2
+    except ModuleNotFoundError as exc:             # e.g. 'dashboard' in the service-only package
+        log.error("'%s' needs %s, which is not installed in this copy of the project", args.command, exc.name)
+        return 2
 
 
 # ------------------------------------------------------------------ commands
@@ -152,38 +167,38 @@ def cmd_run_once(cfg, args):
 
 
 def _log_status(cfg):
-    from . import pipeline
-    df = pipeline.status(cfg)
-    if df.empty:
-        return
-    unhealthy = df[~df["is_healthy"].astype(bool)]
-    log.info("Health Index: %d reclosers, %d not healthy%s", len(df), len(unhealthy),
-             (": " + ", ".join(f"{r.asset_id} {r.health_index:.0f} ({r.health_class})" for r in unhealthy.itertuples()))
-             if len(unhealthy) else "")
+    from .generator import log_health
+    log_health(cfg)
 
 
 def cmd_scheduler(cfg, args):
-    from apscheduler.schedulers.blocking import BlockingScheduler
+    """The real-time generator in this console: updates at :00 :15 :30 :45 (+10 s) until Ctrl+C."""
+    import threading
 
-    from . import pipeline
-
-    def job():
-        try:
-            res = pipeline.update(cfg)
-            log.info("collected %d interval(s); data up to %s UTC", res["intervals"], res["last_ts"])
-            _log_status(cfg)
-        except Exception:                      # keep the scheduler alive; next run catches up
-            log.exception("update failed - will retry at the next interval")
-
-    log.info("Scheduler started: every 15 minutes at :00 :15 :30 :45 (+10 s). Ctrl+C to stop.")
-    job()
-    sched = BlockingScheduler(timezone="UTC")
-    sched.add_job(job, "cron", minute="0,15,30,45", second=10, max_instances=1, coalesce=True,
-                  misfire_grace_time=600, id="ar_update")
+    from .generator import run_generator
+    stop = threading.Event()
+    log.info("Real-time generator in this console. Ctrl+C to stop. "
+             "(To run it in the background at every boot instead: python main.py service install)")
     try:
-        sched.start()
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Scheduler stopped")
+        run_generator(cfg, stop, mode="console")
+    except KeyboardInterrupt:
+        stop.set()
+
+
+def cmd_package_service(cfg, args):
+    from pathlib import Path
+
+    from .packaging import build_service_package
+    path = build_service_package(Path(args.out) if args.out else None)
+    log.info("service package written: %s (%.0f kB). Send this zip; the receiver follows README.md inside it.",
+             path, path.stat().st_size / 1024)
+
+
+def cmd_service(cfg, args):
+    if args.action == "run":
+        return cmd_scheduler(cfg, args)
+    from .service import manage
+    return manage(args.action, cfg, start=not args.no_start)
 
 
 def cmd_status(cfg, args):
@@ -269,6 +284,9 @@ def cmd_dashboard(cfg, args):
 
     from .config import ROOT
     app = ROOT / "ar_gen" / "dashboard_app.py"
+    if not app.exists():
+        log.error("The dashboard is not part of this copy of the project (service-only package).")
+        return 2
     url = f"http://localhost:{args.port}"
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
@@ -302,7 +320,17 @@ def cmd_maintenance_done(cfg, args):
              res["hi_before"], res["hi_after"], res["recomputed_rows"])
 
 
+def _ml_switched_off(cfg) -> bool:
+    if ml_enabled(cfg):
+        return False
+    print("ML is switched off (config.yaml: ml: enabled: false). The collector and the dashboard run without it; "
+          "set it to true to use the ML models again.")
+    return True
+
+
 def cmd_ml_status(cfg, args):
+    if _ml_switched_off(cfg):
+        return 0
     from .ml_scoring import load_model
     folder = cfg["paths"]["models_dir"]
     try:
@@ -323,6 +351,8 @@ def cmd_ml_status(cfg, args):
 
 
 def cmd_ml_score(cfg, args):
+    if _ml_switched_off(cfg):
+        return 2
     from . import pipeline
     from .ml_scoring import load_model
     model = load_model(cfg["paths"]["models_dir"])
@@ -333,6 +363,45 @@ def cmd_ml_score(cfg, args):
         engine, start, end = _range(cfg, args)
         n = pipeline.score_and_summarise(cfg, engine, start, end, model)
     log.info("scored %d rows with model %s", n, model.model_version)
+
+
+def cmd_dl_status(cfg, args):
+    if _ml_switched_off(cfg):
+        return 0
+    from .dl_scoring import load_dl_model
+    folder = cfg["paths"]["dl_models_dir"]
+    try:
+        model = load_dl_model(folder)
+    except (ValueError, RuntimeError) as exc:
+        print(f"The deep-learning model in {folder} cannot be used: {exc}")
+        return 2
+    if model is None:
+        print(f"No deep-learning model installed in {folder}.\n"
+              "Train it in Google Colab with notebooks/AR_DL_Colab.ipynb (docs/ML_COLAB_GUIDE.md) and unzip "
+              "ar_dl_model.zip into that folder.")
+        return 0
+    meta = model.meta
+    print(f"Deep-learning model {model.model_version} ({meta.get('arch', '?')}) - trained {meta.get('trained_utc')}, "
+          f"data until {meta.get('data_until_utc')}")
+    print(f"  alarm threshold: {model.threshold:.3f} | inputs: {len(meta['features'])} | window: "
+          f"{meta['window_steps']} steps x {meta['step_hours']} h | history read: {model.history_days} days")
+    for key, value in (meta.get("metrics") or {}).items():
+        print(f"  {key}: {value}")
+
+
+def cmd_dl_score(cfg, args):
+    if _ml_switched_off(cfg):
+        return 2
+    from . import pipeline
+    from .dl_scoring import load_dl_model, score_stored
+    model = load_dl_model(cfg["paths"]["dl_models_dir"])
+    if model is None:
+        log.error("No deep-learning model installed in %s - see docs/ML_COLAB_GUIDE.md", cfg["paths"]["dl_models_dir"])
+        return 2
+    with pipeline.run_lock(cfg, wait_s=pipeline.LOCK_WAIT_S):
+        engine, start, end = _range(cfg, args)
+        n = score_stored(cfg, engine, start, end, model)
+    log.info("scored %d rows with deep-learning model %s", n, model.model_version)
 
 
 def cmd_prune_history(cfg, args):
@@ -423,6 +492,6 @@ def cmd_compute_hi(cfg, args):
 COMMANDS = {
     "init-db": cmd_init_db, "seed": cmd_seed, "backfill": cmd_backfill, "run-once": cmd_run_once,
     "scheduler": cmd_scheduler, "status": cmd_status, "live": cmd_live, "validate": cmd_validate,
-    "export-dataset": cmd_export_dataset, "copy-db": cmd_copy_db, "generate-ml-data": cmd_generate_ml_data, "set-locations": cmd_set_locations, "prune-history": cmd_prune_history, "ml-status": cmd_ml_status, "ml-score": cmd_ml_score, "maintenance-done": cmd_maintenance_done, "dashboard": cmd_dashboard, "compute-variables": cmd_compute_variables,
+    "export-dataset": cmd_export_dataset, "copy-db": cmd_copy_db, "generate-ml-data": cmd_generate_ml_data, "set-locations": cmd_set_locations, "prune-history": cmd_prune_history, "service": cmd_service, "package-service": cmd_package_service, "ml-status": cmd_ml_status, "ml-score": cmd_ml_score, "dl-status": cmd_dl_status, "dl-score": cmd_dl_score, "maintenance-done": cmd_maintenance_done, "dashboard": cmd_dashboard, "compute-variables": cmd_compute_variables,
     "compute-hi": cmd_compute_hi,
 }

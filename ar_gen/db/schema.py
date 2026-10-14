@@ -311,6 +311,21 @@ ar_ml_prediction_15min = sa.Table(
 )
 
 # Daily Health Index (and ML) summary per recloser per local day (Asia/Colombo).
+# Deep-learning model (models/dl, notebooks/AR_DL_Colab.ipynb): separate from the LightGBM predictions.
+ar_dl_prediction_15min = sa.Table(
+    "ar_dl_prediction_15min", metadata,
+    sa.Column("asset_id", sa.String(16), sa.ForeignKey("asset_master.asset_id"), primary_key=True),
+    sa.Column("ts", DT3, primary_key=True),
+    sa.Column("p_fail_30d", sa.Double(), nullable=False),
+    sa.Column("dl_risk_class", sa.String(10), nullable=False),
+    sa.Column("dl_healthy", sa.Boolean, nullable=False),
+    sa.Column("top_component", sa.String(16)),
+    sa.Column("top_component_p", sa.Double()),
+    sa.Column("model_version", sa.String(40), nullable=False),
+    sa.Column("computed_at", DT3, nullable=False),
+    sa.Index("ix_dlpred_ts", "ts"),
+)
+
 ar_daily_summary = sa.Table(
     "ar_daily_summary", metadata,
     sa.Column("asset_id", sa.String(16), sa.ForeignKey("asset_master.asset_id"), primary_key=True),
@@ -333,6 +348,7 @@ ar_daily_summary = sa.Table(
 INSERT_ORDER = [
     "firmware_release", "asset_master", "asset_location", "hi_reset_log", "fault_events", "failure_log", "co_operations",
     "maintenance_log", "alarm_events", "battery_tests", "comms_events", "telemetry_15min",
-    "ar_variables_15min", "ar_health_index_15min", "ar_ml_prediction_15min", "ar_daily_summary",
+    "ar_variables_15min", "ar_health_index_15min", "ar_ml_prediction_15min", "ar_dl_prediction_15min",
+    "ar_daily_summary",
 ]
 TABLES = {t.name: t for t in metadata.sorted_tables}

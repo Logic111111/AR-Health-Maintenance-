@@ -33,8 +33,9 @@ def view_state(snapshot: pd.DataFrame) -> pdk.ViewState:
                          longitude=float((lon_lo + lon_hi) / 2 + 0.12), zoom=zoom, pitch=50, bearing=-20)
 
 
-def build_deck(snapshot: pd.DataFrame, branches: pd.DataFrame, height_mode: str = "risk") -> pdk.Deck:
-    """height_mode 'risk' = 100 - HI, 'ml' = ML failure probability x 100."""
+def build_deck(snapshot: pd.DataFrame, branches: pd.DataFrame, height_mode: str = "risk",
+               show_ml: bool = True) -> pdk.Deck:
+    """height_mode 'risk' = 100 - HI, 'ml' = ML failure probability x 100. show_ml=False leaves ML out of the tooltip."""
     data = snapshot.dropna(subset=["latitude", "longitude"]).copy()
     if height_mode == "ml" and "ml_p" in data:
         data["elev"] = (pd.to_numeric(data["ml_p"], errors="coerce").fillna(0.0) * 100.0).clip(lower=4.0)
@@ -75,9 +76,10 @@ def build_deck(snapshot: pd.DataFrame, branches: pd.DataFrame, height_mode: str 
                       size_units="pixels", get_color=[210, 250, 255, 255], get_pixel_offset=[0, -28],
                       get_text_anchor="'middle'", get_alignment_baseline="'bottom'", billboard=True, pickable=False),
         ]
+    ml_html = " &nbsp; ML risk <b>{ml_txt}</b><br/>Likely part: {part_txt} &nbsp; " if show_ml else "<br/>"
     tooltip = {"html": "<b style='font-family:Orbitron'>{asset_id_e}</b> &nbsp; {status_e}<br/>"
-                       "Health Index <b>{hi_txt}</b> ({health_class_e}) &nbsp; ML risk <b>{ml_txt}</b><br/>"
-                       "Likely part: {part_txt} &nbsp; Worst: {worst_txt}<br/>Open failure: {fail_txt}<br/>"
+                       "Health Index <b>{hi_txt}</b> ({health_class_e})" + ml_html +
+                       "Worst: {worst_txt}<br/>Open failure: {fail_txt}<br/>"
                        "Battery {batt_txt} &nbsp; Comms {comms_txt} &nbsp; Switch {switch_state_e}<br/>"
                        "<span style='color:#8aa0c2'>{area_name_e} · {feeder_name_e}</span>",
                "style": {"backgroundColor": "rgba(5,10,20,0.92)", "color": "#e6f1ff", "fontSize": "12px",

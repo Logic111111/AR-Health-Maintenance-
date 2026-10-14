@@ -8,3 +8,9 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+[server]
+# No source-file watcher: the dashboard is not being edited while it runs, and with Python 3.13 on Windows stopping
+# the watcher when a browser tab disconnects can crash the whole process
+# ("Fatal Python error: _PySemaphore_Wakeup: parking_lot: ReleaseSemaphore failed").
+fileWatcherType = "none"

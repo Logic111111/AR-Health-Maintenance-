@@ -14,6 +14,176 @@ import nbformat as nbf
 ROOT = Path(__file__).resolve().parent.parent
 FEATURES_SRC = ROOT / "ar_gen" / "ml_features.py"
 
+# Cells shared with the deep-learning notebook (build_dl_notebook.py), so both notebooks load the data,
+# split the months and judge alarms in exactly the same way.
+FIND_DATA_CODE = """
+candidates = [os.environ.get("AR_ML_DATA", ""), DATA_FILE, f"/content/drive/MyDrive/{DRIVE_FOLDER}/{DATA_FILE}",
+              f"/content/drive/MyDrive/{DATA_FILE}", f"/content/{DATA_FILE}",
+              os.path.join("..", "output", "ml_generated", DATA_FILE)]
+path = next((p for p in candidates if p and os.path.exists(p)), None)
+if path is None and IN_COLAB:
+    from google.colab import drive
+    drive.mount("/content/drive")
+    path = next((p for p in candidates if p and os.path.exists(p)), None)
+    if path is None:
+        from google.colab import files
+        print(f"{DATA_FILE} is not in Drive/{DRIVE_FOLDER} - choose it from your computer instead")
+        path = next(iter(files.upload()))
+if path is None:
+    raise FileNotFoundError(f"Put {DATA_FILE} in Google Drive/{DRIVE_FOLDER}, next to this notebook, or set AR_ML_DATA")
+print("Using", path)
+"""
+
+LOAD_DATA_CODE = """
+t0 = time.time()
+BOOL_COLS = ["telemetry_present", "is_healthy", "failed_now", "failure_next_7d", "failure_next_30d",
+             "censored_7d", "censored_30d"]
+parts, keep_ids = [], None
+for chunk in pd.read_csv(path, chunksize=300_000, parse_dates=["ts"], low_memory=False):
+    chunk = chunk[chunk["ts"].dt.minute == 0]                  # one row per recloser per hour
+    if SMOKE:                                                  # tiny run: only 15 reclosers
+        keep_ids = keep_ids or sorted(chunk["asset_id"].unique())[:15]
+        chunk = chunk[chunk["asset_id"].isin(keep_ids)]
+    floats = chunk.select_dtypes("float64").columns.drop("days_to_next_failure", errors="ignore")
+    chunk[floats] = chunk[floats].astype("float32")            # halves the memory
+    parts.append(chunk)
+df = pd.concat(parts, ignore_index=True).sort_values(["asset_id", "ts"]).reset_index(drop=True)
+del parts
+for c in BOOL_COLS:
+    df[c] = df[c].astype(str).str.lower().eq("true")
+print(f"{len(df):,} hourly rows | {df['asset_id'].nunique()} reclosers | "
+      f"{df['ts'].min():%Y-%m-%d} -> {df['ts'].max():%Y-%m-%d} (UTC) | loaded in {time.time() - t0:.0f} s")
+"""
+
+FAILURES_CODE = """
+f = df.loc[df["days_to_next_failure"].notna(), ["asset_id", "ts", "days_to_next_failure", "next_failure_component"]].copy()
+f["failure_time"] = f["ts"] + pd.to_timedelta(f["days_to_next_failure"].astype(float), unit="D")
+f = f.sort_values(["asset_id", "failure_time"])
+new = (f["asset_id"] != f["asset_id"].shift()) | (f["failure_time"].diff() > pd.Timedelta(hours=2))
+failures = (f.loc[new, ["asset_id", "failure_time", "next_failure_component"]]
+            .rename(columns={"next_failure_component": "component"}).reset_index(drop=True))
+failures["failure_time"] = failures["failure_time"].dt.round("min")
+print(f"{len(failures)} failures in {failures['asset_id'].nunique()} reclosers | "
+      f"rows labelled 'fails within 30 days': {df['failure_next_30d'].mean():.1%}")
+display(failures["component"].value_counts().rename_axis("component").to_frame("failures"))
+"""
+
+FEATURES_CODE = """
+import ar_ml_features
+importlib.reload(ar_ml_features)
+from ar_ml_features import FEATURE_VERSION, build_features, feature_names
+
+t0 = time.time()
+X_all = build_features(df, step_minutes=60).astype("float32")
+y_all = df["failure_next_30d"].astype(int).to_numpy()
+FEATURES = feature_names()
+print(f"feature version {FEATURE_VERSION}: {len(FEATURES)} inputs for {len(X_all):,} rows in {time.time() - t0:.0f} s")
+"""
+
+SPLIT_CODE = """
+def safe_ap(y, s):
+    return average_precision_score(y, s) if 0 < np.sum(y) < len(y) else float("nan")
+
+def safe_auc(y, s):
+    return roc_auc_score(y, s) if 0 < np.sum(y) < len(y) else float("nan")
+
+usable = (~df["censored_30d"] & ~df["failed_now"]).to_numpy()
+t_first, t_last = df.loc[usable, "ts"].min(), df.loc[usable, "ts"].max()
+GAP = pd.Timedelta(days=HORIZON_DAYS)
+TEST_START = (t_first + (t_last - t_first) * 0.65).normalize()
+VALID_START = TEST_START - GAP - pd.Timedelta(days=90)
+ts = df["ts"]
+fit_mask = usable & (ts < VALID_START - GAP).to_numpy()
+valid_mask = usable & ((ts >= VALID_START) & (ts < TEST_START - GAP)).to_numpy()
+test_mask = usable & (ts >= TEST_START).to_numpy()
+
+def failures_between(lo, hi):
+    return failures[(failures["failure_time"] > lo) & (failures["failure_time"] <= hi)]
+
+split = pd.DataFrame({
+    "from": [t_first, VALID_START, TEST_START], "to": [VALID_START - GAP, TEST_START - GAP, t_last],
+    "rows": [fit_mask.sum(), valid_mask.sum(), test_mask.sum()],
+    "positive rows %": [100 * y_all[m].mean() for m in (fit_mask, valid_mask, test_mask)],
+    "failures": [len(failures_between(t_first, VALID_START)), len(failures_between(VALID_START, TEST_START)),
+                 len(failures_between(TEST_START, t_last + GAP))]}, index=["fit", "valid", "test"])
+display(split.round(1))
+for part, m in (("fit", fit_mask), ("valid", valid_mask), ("test", test_mask)):
+    if y_all[m].sum() == 0:
+        raise RuntimeError(f"The {part} months contain no failures, so the model cannot learn or be checked. "
+                           "Generate more data on the PC (more reclosers or more days) and run again.")
+"""
+
+CALIBRATE_CODE = """
+iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0).fit(raw_val, y_val)
+CAL_X, CAL_Y = [float(v) for v in iso.X_thresholds_], [float(v) for v in iso.y_thresholds_]
+
+def calibrate(raw):
+    return np.clip(np.interp(raw, CAL_X, CAL_Y), 0.0, 1.0)
+
+p_val = calibrate(raw_val)
+print(f"{len(CAL_X)} calibration points | validation: mean predicted {p_val.mean():.3f} vs observed {y_val.mean():.3f}")
+"""
+
+THRESHOLD_CODE = """
+def event_metrics(frame, warn, fails):
+    warn = pd.Series(np.asarray(warn, dtype=bool), index=frame.index)
+    by_asset = {a: g for a, g in frame.assign(_w=warn).groupby("asset_id")}
+    rows = []
+    for fl in fails.itertuples():
+        g = by_asset.get(fl.asset_id)
+        hit = pd.Series(dtype="datetime64[ns]") if g is None else g.loc[
+            g["_w"] & (g["ts"] < fl.failure_time) & (g["ts"] > fl.failure_time - pd.Timedelta(days=HORIZON_DAYS)), "ts"]
+        lead = (fl.failure_time - hit.min()).total_seconds() / 86400 if len(hit) else np.nan
+        rows.append((fl.asset_id, fl.failure_time, fl.component, len(hit) > 0, lead))
+    per = pd.DataFrame(rows, columns=["asset_id", "failure_time", "component", "caught", "warning_days"])
+    alarms = frame[warn.to_numpy() & ~frame["failure_next_30d"].to_numpy()]
+    false_days = alarms.assign(day=alarms["ts"].dt.floor("D")).drop_duplicates(["asset_id", "day"]).shape[0]
+    ar_months = frame.groupby("asset_id")["ts"].agg(lambda s: (s.max() - s.min()).days / 30.44).sum()
+    return per, false_days / max(ar_months, 1e-9)
+
+val_frame = df.loc[valid_mask, ["asset_id", "ts", "failure_next_30d"]].assign(p=p_val)
+val_fails = failures_between(VALID_START, TEST_START)
+grid = []
+for thr in np.unique(np.quantile(p_val, np.linspace(0.5, 0.999, 80))):
+    per, fa = event_metrics(val_frame, val_frame["p"] >= thr, val_fails)
+    grid.append((float(thr), per["caught"].mean() if len(per) else np.nan, fa))
+grid = pd.DataFrame(grid, columns=["threshold", "share_of_failures_caught", "false_alarm_days_per_ar_month"])
+ok = grid[(grid["false_alarm_days_per_ar_month"] <= FALSE_ALARM_BUDGET) & grid["share_of_failures_caught"].notna()]
+if len(ok) and ok["share_of_failures_caught"].max() > 0:
+    THRESHOLD = float(ok.sort_values(["share_of_failures_caught", "threshold"], ascending=[False, False]).iloc[0]["threshold"])
+    how = f"most failures caught within {FALSE_ALARM_BUDGET} false-alarm day(s) per AR-month"
+else:
+    prec, rec, thr = precision_recall_curve(y_val, p_val)
+    f1 = 2 * prec * rec / np.maximum(prec + rec, 1e-9)
+    THRESHOLD = float(thr[np.nanargmax(f1[:-1])]) if len(thr) else 0.5
+    how = "best F1 (no level met the false-alarm budget)"
+print(f"alarm level: probability >= {THRESHOLD:.3f} ({how})")
+"""
+
+DAILY_CODE = """
+d = test.assign(day=test["ts"].dt.tz_localize("UTC").dt.tz_convert("Asia/Colombo").dt.date)
+daily = d.groupby(["asset_id", "day"]).agg(avg_hi=("health_index", "mean"), max_p=("p", "max")).reset_index()
+daily["hi_healthy"] = daily["avg_hi"] >= HI_HEALTHY_MIN
+daily["ml_healthy"] = daily["max_p"] < THRESHOLD
+daily["agree"] = daily["hi_healthy"] == daily["ml_healthy"]
+print(f"{len(daily):,} recloser-days | HI and ML agree on {daily['agree'].mean():.1%}")
+display(pd.crosstab(daily["hi_healthy"].map({True: "HI: healthy", False: "HI: NOT healthy"}),
+                    daily["ml_healthy"].map({True: "ML: healthy", False: "ML: NOT healthy"})))
+top = daily.groupby("asset_id")["max_p"].max().sort_values(ascending=False).head(20).index
+heat = daily[daily["asset_id"].isin(top)].pivot(index="asset_id", columns="day", values="max_p")
+plt.figure(figsize=(16, 6))
+plt.imshow(heat.to_numpy(dtype=float), aspect="auto", cmap="inferno", vmin=0, vmax=max(THRESHOLD * 2, 0.05))
+plt.yticks(range(len(heat)), heat.index)
+plt.colorbar(label="daily max ML probability")
+plt.title("Daily ML risk for the 20 highest-risk reclosers (test months)")
+plt.show()
+"""
+
+
+def features_writefile_code() -> str:
+    """The cell that writes ar_gen/ml_features.py, verbatim, into the Colab session."""
+    return "%%writefile ar_ml_features.py\n" + FEATURES_SRC.read_text(encoding="utf-8").strip()
+
 
 def _cells() -> list:
     cells = []
@@ -102,60 +272,14 @@ def _cells() -> list:
     The cell first looks in Google Drive (`MyDrive/AR_ML/`) and asks for permission to mount it. If the file is not
     there, an upload box appears instead. The hourly file is ~140 MB, so uploading through Drive is much faster.
     """)
-    code("""
-    candidates = [os.environ.get("AR_ML_DATA", ""), DATA_FILE, f"/content/drive/MyDrive/{DRIVE_FOLDER}/{DATA_FILE}",
-                  f"/content/drive/MyDrive/{DATA_FILE}", f"/content/{DATA_FILE}",
-                  os.path.join("..", "output", "ml_generated", DATA_FILE)]
-    path = next((p for p in candidates if p and os.path.exists(p)), None)
-    if path is None and IN_COLAB:
-        from google.colab import drive
-        drive.mount("/content/drive")
-        path = next((p for p in candidates if p and os.path.exists(p)), None)
-        if path is None:
-            from google.colab import files
-            print(f"{DATA_FILE} is not in Drive/{DRIVE_FOLDER} - choose it from your computer instead")
-            path = next(iter(files.upload()))
-    if path is None:
-        raise FileNotFoundError(f"Put {DATA_FILE} in Google Drive/{DRIVE_FOLDER}, next to this notebook, or set AR_ML_DATA")
-    print("Using", path)
-    """)
-    code("""
-    t0 = time.time()
-    BOOL_COLS = ["telemetry_present", "is_healthy", "failed_now", "failure_next_7d", "failure_next_30d",
-                 "censored_7d", "censored_30d"]
-    parts, keep_ids = [], None
-    for chunk in pd.read_csv(path, chunksize=300_000, parse_dates=["ts"], low_memory=False):
-        chunk = chunk[chunk["ts"].dt.minute == 0]                  # one row per recloser per hour
-        if SMOKE:                                                  # tiny run: only 15 reclosers
-            keep_ids = keep_ids or sorted(chunk["asset_id"].unique())[:15]
-            chunk = chunk[chunk["asset_id"].isin(keep_ids)]
-        floats = chunk.select_dtypes("float64").columns.drop("days_to_next_failure", errors="ignore")
-        chunk[floats] = chunk[floats].astype("float32")            # halves the memory
-        parts.append(chunk)
-    df = pd.concat(parts, ignore_index=True).sort_values(["asset_id", "ts"]).reset_index(drop=True)
-    del parts
-    for c in BOOL_COLS:
-        df[c] = df[c].astype(str).str.lower().eq("true")
-    print(f"{len(df):,} hourly rows | {df['asset_id'].nunique()} reclosers | "
-          f"{df['ts'].min():%Y-%m-%d} -> {df['ts'].max():%Y-%m-%d} (UTC) | loaded in {time.time() - t0:.0f} s")
-    """)
+    code(FIND_DATA_CODE)
+    code(LOAD_DATA_CODE)
 
     md("""
     ## 2. Explore the failures
     Every row carries the days until that recloser's next recorded failure. The list of failures is rebuilt from it.
     """)
-    code("""
-    f = df.loc[df["days_to_next_failure"].notna(), ["asset_id", "ts", "days_to_next_failure", "next_failure_component"]].copy()
-    f["failure_time"] = f["ts"] + pd.to_timedelta(f["days_to_next_failure"].astype(float), unit="D")
-    f = f.sort_values(["asset_id", "failure_time"])
-    new = (f["asset_id"] != f["asset_id"].shift()) | (f["failure_time"].diff() > pd.Timedelta(hours=2))
-    failures = (f.loc[new, ["asset_id", "failure_time", "next_failure_component"]]
-                .rename(columns={"next_failure_component": "component"}).reset_index(drop=True))
-    failures["failure_time"] = failures["failure_time"].dt.round("min")
-    print(f"{len(failures)} failures in {failures['asset_id'].nunique()} reclosers | "
-          f"rows labelled 'fails within 30 days': {df['failure_next_30d'].mean():.1%}")
-    display(failures["component"].value_counts().rename_axis("component").to_frame("failures"))
-    """)
+    code(FAILURES_CODE)
     code("""
     fig, axes = plt.subplots(1, 2, figsize=(15, 4))
     monthly = failures.set_index("failure_time").resample("MS")["asset_id"].count()
@@ -182,17 +306,7 @@ def _cells() -> list:
     the label columns, which are the answers.
     """)
     code("%%writefile ar_ml_features.py\n" + FEATURES_SRC.read_text(encoding="utf-8").strip())
-    code("""
-    import ar_ml_features
-    importlib.reload(ar_ml_features)
-    from ar_ml_features import FEATURE_VERSION, build_features, feature_names
-
-    t0 = time.time()
-    X_all = build_features(df, step_minutes=60).astype("float32")
-    y_all = df["failure_next_30d"].astype(int).to_numpy()
-    FEATURES = feature_names()
-    print(f"feature version {FEATURE_VERSION}: {len(FEATURES)} inputs for {len(X_all):,} rows in {time.time() - t0:.0f} s")
-    """)
+    code(FEATURES_CODE)
 
     md("""
     ## 4. Split by time, never randomly
@@ -207,38 +321,7 @@ def _cells() -> list:
     A **30-day gap** separates the parts, because each label looks 30 days ahead. Rows whose outcome is unknown
     (`censored_30d`) and rows where the recloser is already broken (`failed_now`) are left out.
     """)
-    code("""
-    def safe_ap(y, s):
-        return average_precision_score(y, s) if 0 < np.sum(y) < len(y) else float("nan")
-
-    def safe_auc(y, s):
-        return roc_auc_score(y, s) if 0 < np.sum(y) < len(y) else float("nan")
-
-    usable = (~df["censored_30d"] & ~df["failed_now"]).to_numpy()
-    t_first, t_last = df.loc[usable, "ts"].min(), df.loc[usable, "ts"].max()
-    GAP = pd.Timedelta(days=HORIZON_DAYS)
-    TEST_START = (t_first + (t_last - t_first) * 0.65).normalize()
-    VALID_START = TEST_START - GAP - pd.Timedelta(days=90)
-    ts = df["ts"]
-    fit_mask = usable & (ts < VALID_START - GAP).to_numpy()
-    valid_mask = usable & ((ts >= VALID_START) & (ts < TEST_START - GAP)).to_numpy()
-    test_mask = usable & (ts >= TEST_START).to_numpy()
-
-    def failures_between(lo, hi):
-        return failures[(failures["failure_time"] > lo) & (failures["failure_time"] <= hi)]
-
-    split = pd.DataFrame({
-        "from": [t_first, VALID_START, TEST_START], "to": [VALID_START - GAP, TEST_START - GAP, t_last],
-        "rows": [fit_mask.sum(), valid_mask.sum(), test_mask.sum()],
-        "positive rows %": [100 * y_all[m].mean() for m in (fit_mask, valid_mask, test_mask)],
-        "failures": [len(failures_between(t_first, VALID_START)), len(failures_between(VALID_START, TEST_START)),
-                     len(failures_between(TEST_START, t_last + GAP))]}, index=["fit", "valid", "test"])
-    display(split.round(1))
-    for part, m in (("fit", fit_mask), ("valid", valid_mask), ("test", test_mask)):
-        if y_all[m].sum() == 0:
-            raise RuntimeError(f"The {part} months contain no failures, so the model cannot learn or be checked. "
-                               "Generate more data on the PC (more reclosers or more days) and run again.")
-    """)
+    code(SPLIT_CODE)
 
     md("## 5. Baseline: logistic regression\nA simple straight-line model. LightGBM has to beat it to be worth using.")
     code("""
@@ -302,16 +385,7 @@ def _cells() -> list:
     that match how often failures really followed. The mapping is stored as numbers in the model file, and the
     dashboard applies exactly the same mapping.
     """)
-    code("""
-    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0).fit(raw_val, y_val)
-    CAL_X, CAL_Y = [float(v) for v in iso.X_thresholds_], [float(v) for v in iso.y_thresholds_]
-
-    def calibrate(raw):
-        return np.clip(np.interp(raw, CAL_X, CAL_Y), 0.0, 1.0)
-
-    p_val = calibrate(raw_val)
-    print(f"{len(CAL_X)} calibration points | validation: mean predicted {p_val.mean():.3f} vs observed {y_val.mean():.3f}")
-    """)
+    code(CALIBRATE_CODE)
 
     md("""
     ## 8. Alarm level (threshold)
@@ -322,41 +396,7 @@ def _cells() -> list:
     The chosen level catches the most failures while staying within `FALSE_ALARM_BUDGET`. If no level fits the
     budget, the level with the best F1 is used.
     """)
-    code("""
-    def event_metrics(frame, warn, fails):
-        warn = pd.Series(np.asarray(warn, dtype=bool), index=frame.index)
-        by_asset = {a: g for a, g in frame.assign(_w=warn).groupby("asset_id")}
-        rows = []
-        for fl in fails.itertuples():
-            g = by_asset.get(fl.asset_id)
-            hit = pd.Series(dtype="datetime64[ns]") if g is None else g.loc[
-                g["_w"] & (g["ts"] < fl.failure_time) & (g["ts"] > fl.failure_time - pd.Timedelta(days=HORIZON_DAYS)), "ts"]
-            lead = (fl.failure_time - hit.min()).total_seconds() / 86400 if len(hit) else np.nan
-            rows.append((fl.asset_id, fl.failure_time, fl.component, len(hit) > 0, lead))
-        per = pd.DataFrame(rows, columns=["asset_id", "failure_time", "component", "caught", "warning_days"])
-        alarms = frame[warn.to_numpy() & ~frame["failure_next_30d"].to_numpy()]
-        false_days = alarms.assign(day=alarms["ts"].dt.floor("D")).drop_duplicates(["asset_id", "day"]).shape[0]
-        ar_months = frame.groupby("asset_id")["ts"].agg(lambda s: (s.max() - s.min()).days / 30.44).sum()
-        return per, false_days / max(ar_months, 1e-9)
-
-    val_frame = df.loc[valid_mask, ["asset_id", "ts", "failure_next_30d"]].assign(p=p_val)
-    val_fails = failures_between(VALID_START, TEST_START)
-    grid = []
-    for thr in np.unique(np.quantile(p_val, np.linspace(0.5, 0.999, 80))):
-        per, fa = event_metrics(val_frame, val_frame["p"] >= thr, val_fails)
-        grid.append((float(thr), per["caught"].mean() if len(per) else np.nan, fa))
-    grid = pd.DataFrame(grid, columns=["threshold", "share_of_failures_caught", "false_alarm_days_per_ar_month"])
-    ok = grid[(grid["false_alarm_days_per_ar_month"] <= FALSE_ALARM_BUDGET) & grid["share_of_failures_caught"].notna()]
-    if len(ok) and ok["share_of_failures_caught"].max() > 0:
-        THRESHOLD = float(ok.sort_values(["share_of_failures_caught", "threshold"], ascending=[False, False]).iloc[0]["threshold"])
-        how = f"most failures caught within {FALSE_ALARM_BUDGET} false-alarm day(s) per AR-month"
-    else:
-        prec, rec, thr = precision_recall_curve(y_val, p_val)
-        f1 = 2 * prec * rec / np.maximum(prec + rec, 1e-9)
-        THRESHOLD = float(thr[np.nanargmax(f1[:-1])]) if len(thr) else 0.5
-        how = "best F1 (no level met the false-alarm budget)"
-    print(f"alarm level: probability >= {THRESHOLD:.3f} ({how})")
-    """)
+    code(THRESHOLD_CODE)
 
     md("""
     ## 9. Honest test: ML vs Health Index
@@ -508,24 +548,7 @@ def _cells() -> list:
     This is the same daily comparison the project stores in `ar_daily_summary`. HI healthy = daily average HI ≥ 60;
     ML healthy = probability below the alarm level all day.
     """)
-    code("""
-    d = test.assign(day=test["ts"].dt.tz_localize("UTC").dt.tz_convert("Asia/Colombo").dt.date)
-    daily = d.groupby(["asset_id", "day"]).agg(avg_hi=("health_index", "mean"), max_p=("p", "max")).reset_index()
-    daily["hi_healthy"] = daily["avg_hi"] >= HI_HEALTHY_MIN
-    daily["ml_healthy"] = daily["max_p"] < THRESHOLD
-    daily["agree"] = daily["hi_healthy"] == daily["ml_healthy"]
-    print(f"{len(daily):,} recloser-days | HI and ML agree on {daily['agree'].mean():.1%}")
-    display(pd.crosstab(daily["hi_healthy"].map({True: "HI: healthy", False: "HI: NOT healthy"}),
-                        daily["ml_healthy"].map({True: "ML: healthy", False: "ML: NOT healthy"})))
-    top = daily.groupby("asset_id")["max_p"].max().sort_values(ascending=False).head(20).index
-    heat = daily[daily["asset_id"].isin(top)].pivot(index="asset_id", columns="day", values="max_p")
-    plt.figure(figsize=(16, 6))
-    plt.imshow(heat.to_numpy(dtype=float), aspect="auto", cmap="inferno", vmin=0, vmax=max(THRESHOLD * 2, 0.05))
-    plt.yticks(range(len(heat)), heat.index)
-    plt.colorbar(label="daily max ML probability")
-    plt.title("Daily ML risk for the 20 highest-risk reclosers (test months)")
-    plt.show()
-    """)
+    code(DAILY_CODE)
 
     md("""
     ## 14. Export the model for the dashboard

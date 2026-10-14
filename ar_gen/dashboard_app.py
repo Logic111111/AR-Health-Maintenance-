@@ -16,16 +16,17 @@ import pandas as pd                     # noqa: E402
 import streamlit as st                  # noqa: E402
 
 from ar_gen import pipeline             # noqa: E402
-from ar_gen.config import load_config   # noqa: E402
+from ar_gen.config import load_config, ml_enabled   # noqa: E402
 from ar_gen.dashboard_data import (STATUS_MEANING, STATUS_ORDER, alert_feed, branch_summary,  # noqa: E402
-                                   branches, daily_summary_frame, fleet_snapshot, hi_history, latest_variables,
-                                   ml_history, model_status, recent_events, reset_log)
+                                   branches, daily_summary_frame, dl_history, dl_model_status, dl_snapshot,
+                                   fleet_snapshot, hi_history, latest_variables, ml_history, model_status,
+                                   recent_events, reset_log, with_dl)
 from ar_gen.db.engine import create_all  # noqa: E402
 from ar_gen.sim.timeutil import dt_to_ms, zone   # noqa: E402
 from ar_gen.ui.components import (branch_bar, feed_item, gauge_svg, kpi_tile, legend_html,  # noqa: E402
                                   radar_svg, status_pill)
 from ar_gen.ui.map3d import build_deck   # noqa: E402
-from ar_gen.ui.theme import CSS, CYAN, MUTED, STATUS_COLORS_HEX, altair_dark   # noqa: E402
+from ar_gen.ui.theme import CSS, CYAN, MUTED, STATUS_COLORS_HEX, VIOLET, altair_dark   # noqa: E402
 from ar_gen.variables import RESET_GROUPS        # noqa: E402
 
 st.set_page_config(page_title="LECO AR Command Centre", page_icon="⚡", layout="wide",
@@ -35,6 +36,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 CFG = load_config()
 TZ = CFG["timezone"]
 URL = CFG["database_url"]
+ML_ON = ml_enabled(CFG)          # config.yaml ml.enabled: false hides every ML part of the page
 PART_LABELS = {"ALL": "All parts", "BATTERY": "Battery", "SWITCHING": "OSM switch (mechanism / contacts)",
                "COMMS": "Communications (modem / antenna)", "CONTROLLER": "Controller (RC modules)"}
 FACTORS = {"f_battery": "BATTERY", "f_faults": "FAULTS", "f_switching": "SWITCHING", "f_comms": "COMMS",
@@ -53,6 +55,8 @@ FACTOR_VARS = {
     "Comms": ["v28", "v29", "v30", "v31", "v32"],
     "Controlling": ["v33", "v34", "v35", "v36"], "Aging": ["v37", "v38", "v39"], "Environment": ["v40", "v41", "v42"],
 }
+ML_PINK = "#ff2e93"
+MODEL_COLORS = {"LightGBM": ML_PINK, "Deep learning": VIOLET}
 
 
 # ------------------------------------------------------------------ data (cached 30 s)
@@ -66,7 +70,7 @@ def _engine(url: str):
 @st.cache_data(ttl=30, show_spinner=False)
 def _snapshot(url: str):
     ts, snap = fleet_snapshot(_engine(url), CFG)
-    if not model_status(CFG).get("installed"):        # removed / unusable model: its old values are not current
+    if not ML_ON or not model_status(CFG).get("installed"):   # ML off / model unusable: old values are not current
         snap = snap.assign(ml_p=float("nan"), ml_class=None, ml_healthy=None, ml_component=None)
     return ts, snap
 
@@ -79,6 +83,16 @@ def _history(url: str, asset: str):
 @st.cache_data(ttl=30, show_spinner=False)
 def _ml_history(url: str, asset: str):
     return ml_history(_engine(url), asset, days=30, tz=TZ)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _dl_snapshot(url: str):
+    return dl_snapshot(_engine(url))
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _dl_history(url: str, asset: str):
+    return dl_history(_engine(url), asset, days=30, tz=TZ)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -131,7 +145,7 @@ def _filtered(snap: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------ header
-def header(ts, snap: pd.DataFrame, model: dict) -> None:
+def header(ts, snap: pd.DataFrame, model: dict, dl: dict) -> None:
     now = datetime.now(timezone.utc)
     if ts is not None:
         age = (now.replace(tzinfo=None) - pd.Timestamp(ts).to_pydatetime()).total_seconds() / 60
@@ -140,19 +154,27 @@ def header(ts, snap: pd.DataFrame, model: dict) -> None:
         data_txt = f"DATA {_local(ts):%H:%M} · {age:.0f} MIN AGO"
     else:
         beat, data_txt = STATUS_COLORS_HEX["OFFLINE"], "NO DATA"
-    if model.get("installed"):
-        model_txt = f"ML · {html.escape(model['version'])}"
-    elif model.get("error"):
-        model_txt = f'<span class="ar-dot" style="--c:{STATUS_COLORS_HEX["CRITICAL"]}"></span>ML · MODEL ERROR'
-    else:
-        model_txt = "ML · NOT INSTALLED"
+    model_chips = ""
+    if ML_ON:
+        if model.get("installed"):
+            model_txt = f"ML · {html.escape(model['version'])}"
+        elif model.get("error"):
+            model_txt = f'<span class="ar-dot" style="--c:{STATUS_COLORS_HEX["CRITICAL"]}"></span>ML · MODEL ERROR'
+        else:
+            model_txt = "ML · NOT INSTALLED"
+        if dl.get("installed"):
+            model_txt += f'</span><span class="ar-chip">DL · {html.escape(dl["version"])}'
+        elif dl.get("error"):
+            model_txt += (f'</span><span class="ar-chip"><span class="ar-dot" style="--c:{STATUS_COLORS_HEX["CRITICAL"]}">'
+                          '</span>DL · MODEL ERROR')
+        model_chips = f'<span class="ar-chip">{model_txt}</span>'
+    subtitle = "real-time health index &amp; ML failure risk" if ML_ON else "real-time health index"
     st.markdown(
         f'<div class="ar-header"><div><div class="ar-title">LECO · AR HEALTH COMMAND CENTRE</div>'
-        f'<div class="ar-sub">Lanka Electricity Company · {len(snap)} auto reclosers · real-time health index '
-        f'&amp; ML failure risk</div></div><div class="ar-meta">'
-        f'<span class="ar-chip">{now.astimezone(zone(TZ)):%a %d %b · %H:%M} LOCAL</span>'
+        f'<div class="ar-sub">Lanka Electricity Company · {len(snap)} auto reclosers · {subtitle}</div></div>'
+        f'<div class="ar-meta"><span class="ar-chip">{now.astimezone(zone(TZ)):%a %d %b · %H:%M} LOCAL</span>'
         f'<span class="ar-chip"><span class="ar-dot" style="--c:{beat}"></span>{data_txt}</span>'
-        f'<span class="ar-chip">{model_txt}</span></div></div>', unsafe_allow_html=True)
+        f'{model_chips}</div></div>', unsafe_allow_html=True)
 
 
 # ------------------------------------------------------------------ charts
@@ -177,6 +199,27 @@ def hi_chart(rows: pd.DataFrame, ml_rows: pd.DataFrame, threshold: float | None)
     return altair_dark(chart.properties(height=290))
 
 
+def models_chart(rows: pd.DataFrame, risks: dict):
+    """HI (left axis) and the 30-day failure risk of each model (right axis) for one recloser."""
+    hi = alt.Chart(rows).mark_line(color=CYAN, strokeWidth=1.6).encode(
+        x=alt.X("ts_local:T", title=None),
+        y=alt.Y("health_index:Q", title="Health Index", scale=alt.Scale(domain=[0, 100])),
+        tooltip=[alt.Tooltip("ts_local:T", title="time"), alt.Tooltip("health_index:Q", format=".1f", title="HI")])
+    parts = [r.assign(model=name, risk_pct=r["p_fail_30d"] * 100)[["ts_local", "risk_pct", "model"]]
+             for name, r in risks.items() if r is not None and not r.empty]
+    if not parts:
+        return altair_dark(hi.properties(height=380))
+    lines = alt.Chart(pd.concat(parts, ignore_index=True)).mark_line(strokeWidth=1.5).encode(
+        x="ts_local:T",
+        y=alt.Y("risk_pct:Q", title="failure risk % (30 days)", scale=alt.Scale(domain=[0, 100]),
+                axis=alt.Axis(orient="right")),
+        color=alt.Color("model:N", scale=alt.Scale(domain=list(MODEL_COLORS), range=list(MODEL_COLORS.values())),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=["model", alt.Tooltip("ts_local:T", title="time"),
+                 alt.Tooltip("risk_pct:Q", format=".1f", title="risk %")])
+    return altair_dark(alt.layer(hi, lines).resolve_scale(y="independent").properties(height=380))
+
+
 def daily_chart(rows: pd.DataFrame):
     rows = rows.assign(day=pd.to_datetime(rows["day"]), state=rows["hi_healthy"].map({True: "healthy", False: "not healthy"}))
     chart = alt.Chart(rows).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
@@ -191,10 +234,11 @@ def daily_chart(rows: pd.DataFrame):
 
 # ------------------------------------------------------------------ page
 ts, snap = _snapshot(URL)
-model = model_status(CFG)
-header(ts, snap, model)
+model = model_status(CFG) if ML_ON else {}
+dl = dl_model_status(CFG) if ML_ON else {}
+header(ts, snap, model, dl)
 if ts is None or snap.empty:
-    st.info("No data yet - run backfill / scheduler")
+    st.info("No data yet - run backfill, then start the generator (python main.py service install, or service run)")
     st.stop()
 
 with st.sidebar:
@@ -203,7 +247,8 @@ with st.sidebar:
     st.multiselect("LECO branch", all_branches, default=all_branches, key="f_branch")
     st.multiselect("Status", STATUS_ORDER, default=STATUS_ORDER, key="f_status")
     st.text_input("Search recloser", key="f_search", placeholder="e.g. AR-042")
-    st.radio("Column height", ["Risk (100 - HI)", "ML failure risk"], key="f_height")
+    if ML_ON:
+        st.radio("Column height", ["Risk (100 - HI)", "ML failure risk"], key="f_height")
     filtered = _filtered(snap)
     st.markdown("### 🎯 SELECTED RECLOSER")
     options = list(_sorted(filtered)["asset_id"])
@@ -211,9 +256,12 @@ with st.sidebar:
     asset = st.selectbox("Recloser", options, key="asset",
                          format_func=lambda a: f"{a} · {info.loc[a, 'status']} · HI {_fmt(info.loc[a, 'health_index'])}") \
         if options else None
-    st.caption("Refreshes every 60 s. Data: telemetry, V1-V42, Health Index and ML risk every 15 min.")
+    st.caption("Refreshes every 60 s. Data: telemetry, V1-V42, Health Index" + (" and ML risk" if ML_ON else "")
+               + " every 15 min.")
 
-tab_cc, tab_fleet, tab_ar, tab_ml, tab_maint = st.tabs(["Command Centre", "Fleet", "Recloser", "ML vs HI", "Maintenance"])
+TAB_NAMES = ["Command Centre", "Fleet", "Recloser", *(["ML vs HI", "Deep Learning"] if ML_ON else []), "Maintenance"]
+TABS = dict(zip(TAB_NAMES, st.tabs(TAB_NAMES)))
+tab_cc, tab_fleet, tab_ar, tab_maint = (TABS[n] for n in ("Command Centre", "Fleet", "Recloser", "Maintenance"))
 NO_MATCH = "No reclosers match the filters - change them in the sidebar."
 
 with tab_cc:
@@ -230,14 +278,16 @@ with tab_cc:
             col.markdown(kpi_tile(s, n, STATUS_COLORS_HEX[s], KPI_HINT[s],
                                   pulse=s in ("FAULTY", "CRITICAL") and n > 0), unsafe_allow_html=True)
         st.write("")
-        k1, k2, k3, k4 = st.columns(4)
+        kpis = st.columns(4 if ML_ON else 3)
+        k1, k3, k4 = kpis[0], kpis[-2], kpis[-1]
         k1.markdown(kpi_tile("FLEET AVERAGE HI", _fmt(view["health_index"].mean()), CYAN, f"{len(view)} reclosers"),
                     unsafe_allow_html=True)
-        ml_high = int(view["ml_class"].eq("HIGH").sum()) if view["ml_p"].notna().any() else None
-        k2.markdown(kpi_tile("ML HIGH RISK", "-" if ml_high is None else ml_high, "#ff2e93",
-                             "failure likely within 30 days" if ml_high is not None else
-                             ("model cannot be used - see ML vs HI" if model.get("error") else "no ML model yet"),
-                             pulse=bool(ml_high)), unsafe_allow_html=True)
+        if ML_ON:
+            ml_high = int(view["ml_class"].eq("HIGH").sum()) if view["ml_p"].notna().any() else None
+            kpis[1].markdown(kpi_tile("ML HIGH RISK", "-" if ml_high is None else ml_high, "#ff2e93",
+                                      "failure likely within 30 days" if ml_high is not None else
+                                      ("model cannot be used - see ML vs HI" if model.get("error") else "no ML model yet"),
+                                      pulse=bool(ml_high)), unsafe_allow_html=True)
         k3.markdown(kpi_tile("OPEN FAILURES", int((view["open_failures"] != "").sum()), STATUS_COLORS_HEX["FAULTY"],
                              "waiting for repair"), unsafe_allow_html=True)
         k4.markdown(kpi_tile(f"UNHEALTHY (HI < {HEALTHY_MIN:g})", int((view["health_index"] < HEALTHY_MIN).sum()),
@@ -245,11 +295,11 @@ with tab_cc:
                              "need maintenance planning"), unsafe_allow_html=True)
         st.write("")
         left, right = st.columns([3.3, 1.35])
-        mode = "ml" if st.session_state.get("f_height", "").startswith("ML") else "risk"
+        mode = "ml" if ML_ON and st.session_state.get("f_height", "").startswith("ML") else "risk"
         with left:
             br = branches(CFG)
             br = br[br["name"].isin(view["area_name"].unique())]
-            st.pydeck_chart(build_deck(view, br, mode), height=650)
+            st.pydeck_chart(build_deck(view, br, mode, show_ml=ML_ON), height=650)
             st.markdown(legend_html(), unsafe_allow_html=True)
         with right:
             feed = _feed(URL)
@@ -275,7 +325,8 @@ with tab_fleet:
             color = STATUS_COLORS_HEX["GOOD"] if (r.avg_hi or 0) >= CLASSES["GOOD"] else (
                 STATUS_COLORS_HEX["FAIR"] if (r.avg_hi or 0) >= CLASSES["FAIR"] else STATUS_COLORS_HEX["POOR"])
             col.markdown(kpi_tile(r.area_name.upper(), _fmt(r.avg_hi), color,
-                                  f"{r.reclosers} AR · {int(r.alerts)} alert · {int(r.ml_high)} ML high"),
+                                  f"{r.reclosers} AR · {int(r.alerts)} alert"
+                                  + (f" · {int(r.ml_high)} ML high" if ML_ON else "")),
                          unsafe_allow_html=True)
         st.write("")
         view = _sorted(filtered)
@@ -285,11 +336,15 @@ with tab_fleet:
             "Worst variables": view["worst_variables"], "Open failure": view["open_failures"],
             "Battery V": view["battery_voltage"], "Comms": view["comms_connected"], "Switch": view["switch_state"],
             "Feeder": view["feeder_name"]})
-        st.dataframe(table, hide_index=True, width="stretch", height=560, column_config={
-            "HI": st.column_config.ProgressColumn("HI", min_value=0, max_value=100, format="%.1f"),
-            "ML risk %": st.column_config.ProgressColumn("ML risk %", min_value=0, max_value=100, format="%.0f%%"),
-            "Battery V": st.column_config.NumberColumn(format="%.2f"),
-            "Comms": st.column_config.CheckboxColumn("Comms up")})
+        columns = {"HI": st.column_config.ProgressColumn("HI", min_value=0, max_value=100, format="%.1f"),
+                   "Battery V": st.column_config.NumberColumn(format="%.2f"),
+                   "Comms": st.column_config.CheckboxColumn("Comms up")}
+        if ML_ON:
+            columns["ML risk %"] = st.column_config.ProgressColumn("ML risk %", min_value=0, max_value=100,
+                                                                   format="%.0f%%")
+        else:
+            table = table.drop(columns=["ML risk %", "Likely part"])
+        st.dataframe(table, hide_index=True, width="stretch", height=560, column_config=columns)
 
 with tab_ar:
     if asset is None:
@@ -297,15 +352,19 @@ with tab_ar:
     else:
         row = info.loc[asset]
         status_color = STATUS_COLORS_HEX.get(row["status"], CYAN)
-        g1, g2, g3, g4 = st.columns([1, 1, 1.25, 1.9])
+        if ML_ON:
+            g1, g2, g3, g4 = st.columns([1, 1, 1.25, 1.9])
+            ml_val = None if pd.isna(row["ml_p"]) else float(row["ml_p"]) * 100
+            g2.markdown(gauge_svg(ml_val, 100, "ML FAILURE RISK", "#ff2e93", unit="% in 30 days"), unsafe_allow_html=True)
+        else:
+            g1, g3, g4 = st.columns([1, 1.25, 1.9])
         g1.markdown(gauge_svg(row["health_index"], 100, "HEALTH INDEX", status_color, unit="/ 100", decimals=1),
                     unsafe_allow_html=True)
-        ml_val = None if pd.isna(row["ml_p"]) else float(row["ml_p"]) * 100
-        g2.markdown(gauge_svg(ml_val, 100, "ML FAILURE RISK", "#ff2e93", unit="% in 30 days"), unsafe_allow_html=True)
         g3.markdown(radar_svg({label: row[col] for col, label in FACTORS.items()}), unsafe_allow_html=True)
         details = [("Branch / feeder", f"{row['area_name']} · {row['feeder_name']}"),
                    ("Open failure", row["open_failures"] or "none"),
-                   ("Likely failing part (ML)", row["ml_component"] if isinstance(row["ml_component"], str) else "-"),
+                   *([("Likely failing part (ML)", row["ml_component"] if isinstance(row["ml_component"], str) else "-")]
+                     if ML_ON else []),
                    ("Worst variables", row["worst_variables"] or "-"),
                    ("Battery", _fmt(row["battery_voltage"], 2, " V")),
                    ("AC supply", "-" if pd.isna(row["ac_supply_on"]) else ("ON" if row["ac_supply_on"] else "OFF")),
@@ -319,9 +378,10 @@ with tab_ar:
         g4.markdown(f'<div class="ar-panel"><h4>{_html.escape(asset)} &nbsp; {status_pill(row["status"])}</h4>'
                     f'{rows_html}</div>', unsafe_allow_html=True)
         rows, _ = _history(URL, asset)
-        st.markdown("#### HEALTH INDEX & ML RISK · 30 DAYS")
+        st.markdown("#### HEALTH INDEX & ML RISK · 30 DAYS" if ML_ON else "#### HEALTH INDEX · 30 DAYS")
         if not rows.empty:
-            st.altair_chart(hi_chart(rows, _ml_history(URL, asset), model.get("threshold")), width="stretch")
+            st.altair_chart(hi_chart(rows, _ml_history(URL, asset) if ML_ON else None, model.get("threshold")),
+                            width="stretch")
         daily = _daily(URL)
         mine = daily[daily["asset_id"] == asset]
         c1, c2 = st.columns([1.3, 1])
@@ -343,7 +403,7 @@ with tab_ar:
                         lines.append(f"**{k[:3].upper()}** {k[4:].replace('_', ' ')}: `{shown}`")
                 col.markdown(f"**{factor}**\n\n" + "\n\n".join(lines))
 
-with tab_ml:
+def render_ml_tab():
     has_ml = filtered["ml_p"].notna().any() if not filtered.empty else False
     if not model.get("installed"):
         if model.get("error"):
@@ -432,6 +492,112 @@ The full step-by-step guide is in `docs/ML_COLAB_GUIDE.md`.
                                        "HI": disagree["health_index"], "ML risk %": disagree["ml_pct"],
                                        "Likely part": disagree["ml_component"], "Worst variables": disagree["worst_variables"]}),
                          hide_index=True, width="stretch")
+
+def render_dl_tab():
+    if not dl.get("installed"):
+        if dl.get("error"):
+            title = "### The installed deep-learning model cannot be used"
+            err = (f"\n\n⚠ **{dl['error']}**\n\nThe Health Index and the LightGBM model go on as normal; the "
+                   f"deep-learning values are hidden until a working model is in `{dl['folder']}`.")
+        else:
+            title, err = "### No deep-learning model installed yet", ""
+        st.markdown(f"""
+{title}
+The deep-learning model reads the **last 14 days of each recloser as a sequence** and works next to the LightGBM
+model. It is trained in **Google Colab** on a free GPU, not on this PC.{err}
+
+1. Keep `ar_ml_dataset_hourly.csv.gz` in the Google Drive folder **AR_ML** (the same file as for LightGBM). For a
+   side-by-side test, also put `ar_ml_model.zip` there.
+2. Open `notebooks/AR_DL_Colab.ipynb` in Colab, choose **Runtime → Change runtime type → T4 GPU**, then
+   **Runtime → Run all**.
+3. Unzip the downloaded **`ar_dl_model.zip`** into `{dl['folder']}` (not the LightGBM folder).
+4. Run `python main.py dl-score` once. After that, the collector scores every 15 minutes.
+
+PyTorch must be installed on this PC: `python -m pip install torch --index-url https://download.pytorch.org/whl/cpu`.
+The full guide is in `docs/ML_COLAB_GUIDE.md`.
+""")
+    elif filtered.empty:
+        st.info(NO_MATCH)
+    else:
+        view = with_dl(filtered, _dl_snapshot(URL), int(CFG["interval_minutes"]))
+        dthr = float(dl["threshold"])
+        chips = "".join(f'<span class="ar-chip">{html.escape(str(k).replace("_", " ").upper())} · '
+                        f'{html.escape(str(v))}</span>' for k, v in list(dl["metrics"].items())[:10])
+        st.markdown(f'<div class="ar-panel"><h4>DEEP LEARNING {html.escape(dl["version"])} · '
+                    f'{html.escape(dl["arch"].upper())} · WINDOW {html.escape(dl["window"])} · ALARM LEVEL {dthr:.0%}'
+                    f'</h4><div class="ar-meta" style="justify-content:flex-start">{chips}</div></div>',
+                    unsafe_allow_html=True)
+        stale = int(view["dl_stale"].sum())
+        if stale:
+            st.warning(f"{stale} recloser(s) have deep-learning values older than their Health Index, so they are "
+                       "hidden until they are scored again. If `dl-score` is running, wait for it to finish and refresh; "
+                       "otherwise the next 15-minute collector run catches them up (log: `logs/ar_gen.log`).")
+        elif not view["dl_p"].notna().any():
+            st.info("No deep-learning predictions yet. Run `python main.py dl-score` once (it scores all stored "
+                    "data); after that the collector scores every 15 minutes.")
+        else:
+            has_lgbm = bool(model.get("installed")) and view["ml_p"].notna().any()
+            ref = "LIGHTGBM" if has_lgbm else "HI"
+            pts = view.dropna(subset=["dl_p", "ml_p" if has_lgbm else "health_index"]).assign(
+                dl_pct=lambda d: d["dl_p"] * 100, ml_pct=lambda d: d["ml_p"] * 100)
+            dl_warn = pts["dl_p"] >= dthr
+            ref_warn = pts["ml_p"] >= float(model["threshold"]) if has_lgbm else pts["health_index"] < HEALTHY_MIN
+            q1, q2, q3, q4 = st.columns(4)
+            n_high = int(pts["dl_class"].eq("HIGH").sum())
+            q1.markdown(kpi_tile("DL HIGH RISK", n_high, VIOLET, "failure likely within 30 days", pulse=bool(n_high)),
+                        unsafe_allow_html=True)
+            q2.markdown(kpi_tile(f"DL + {ref} WARN", int((dl_warn & ref_warn).sum()), STATUS_COLORS_HEX["CRITICAL"],
+                                 "both agree: act now"), unsafe_allow_html=True)
+            q3.markdown(kpi_tile("ONLY DL WARNS", int((dl_warn & ~ref_warn).sum()), VIOLET, "early warning?"),
+                        unsafe_allow_html=True)
+            q4.markdown(kpi_tile(f"ONLY {ref} WARNS", int((~dl_warn & ref_warn).sum()),
+                                 ML_PINK if has_lgbm else STATUS_COLORS_HEX["POOR"]), unsafe_allow_html=True)
+            if has_lgbm:
+                x_field, x_title, x_rule = "ml_pct", "LightGBM failure risk % (30 days)", float(model["threshold"]) * 100
+            else:
+                x_field, x_title, x_rule = "health_index", "Health Index", HEALTHY_MIN
+            scatter = alt.Chart(pts).mark_circle(size=120, opacity=0.9, stroke="#ffffff", strokeWidth=0.4).encode(
+                x=alt.X(f"{x_field}:Q", title=x_title, scale=alt.Scale(domain=[0, 100])),
+                y=alt.Y("dl_pct:Q", title="Deep-learning failure risk % (30 days)", scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("status:N", scale=alt.Scale(domain=STATUS_ORDER,
+                                                            range=[STATUS_COLORS_HEX[s] for s in STATUS_ORDER]),
+                                legend=alt.Legend(orient="right", title=None)),
+                tooltip=["asset_id", "area_name", "status", alt.Tooltip("health_index:Q", format=".1f", title="HI"),
+                         alt.Tooltip("ml_pct:Q", format=".1f", title="LightGBM risk %"),
+                         alt.Tooltip("dl_pct:Q", format=".1f", title="DL risk %"), "dl_component"])
+            rules = alt.Chart(pd.DataFrame({"x": [x_rule]})).mark_rule(color=MUTED, strokeDash=[4, 4]).encode(x="x:Q") + \
+                alt.Chart(pd.DataFrame({"y": [dthr * 100]})).mark_rule(color=VIOLET, strokeDash=[4, 4]).encode(y="y:Q")
+            c1, c2 = st.columns([1, 1.2])
+            with c1:
+                st.markdown(f"#### DEEP LEARNING VS {ref} · NOW")
+                st.altair_chart(altair_dark((scatter + rules).properties(height=380)), width="stretch")
+            with c2:
+                if asset is not None:
+                    st.markdown(f"#### {html.escape(asset)} · HI & FAILURE RISK · 30 DAYS")
+                    rows, _ = _history(URL, asset)
+                    if not rows.empty:
+                        risks = {"LightGBM": _ml_history(URL, asset) if model.get("installed") else None,
+                                 "Deep learning": _dl_history(URL, asset)}
+                        st.altair_chart(models_chart(rows, risks), width="stretch")
+            ranked = view.sort_values("dl_p", ascending=False, na_position="last")
+            st.markdown("#### RISK RANKING · DEEP LEARNING")
+            st.dataframe(pd.DataFrame({
+                "Recloser": ranked["asset_id"], "Branch": ranked["area_name"], "Status": ranked["status"],
+                "HI": ranked["health_index"], "LightGBM risk %": ranked["ml_p"] * 100, "DL risk %": ranked["dl_p"] * 100,
+                "DL class": ranked["dl_class"], "DL likely part": ranked["dl_component"],
+                "LightGBM likely part": ranked["ml_component"]}), hide_index=True, width="stretch", height=420,
+                column_config={
+                    "HI": st.column_config.ProgressColumn("HI", min_value=0, max_value=100, format="%.1f"),
+                    "LightGBM risk %": st.column_config.ProgressColumn("LightGBM risk %", min_value=0, max_value=100,
+                                                                       format="%.0f%%"),
+                    "DL risk %": st.column_config.ProgressColumn("DL risk %", min_value=0, max_value=100,
+                                                                 format="%.0f%%")})
+
+if ML_ON:
+    with TABS["ML vs HI"]:
+        render_ml_tab()
+    with TABS["Deep Learning"]:
+        render_dl_tab()
 
 with tab_maint:
     if asset is None:

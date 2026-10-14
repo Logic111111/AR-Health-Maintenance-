@@ -43,3 +43,27 @@ def write_tiny_bundle(models_dir, version=FEATURE_VERSION, with_component=True, 
             "data_until_utc": "2026-10-06T00:00:00", "model_version": "test-1"}
     (models_dir / "ml_meta.json").write_text(json.dumps(meta), encoding="utf-8")
     return meta
+
+
+def write_tiny_dl_bundle(folder, arch="gru", version=FEATURE_VERSION, net_version=None, steps=12, step_hours=2,
+                         seed=0):
+    """A deep-learning bundle with random weights: enough to test loading and scoring (nothing is trained)."""
+    import torch
+
+    from ar_gen.dl_model import NET_VERSION, ARNet
+    names = feature_names()
+    torch.manual_seed(seed)
+    config = {"arch": arch, "n_inputs": len(names), "n_components": len(COMPONENTS), "width": 8, "steps": steps}
+    net = ARNet(**config).eval()
+    folder.mkdir(parents=True, exist_ok=True)
+    torch.save({"config": config, "state_dict": net.state_dict()}, folder / "model_dl.pt")
+    meta = {"model_type": "pytorch-sequence", "net_version": NET_VERSION if net_version is None else net_version,
+            "arch": arch, "net_config": config, "feature_version": version, "features": names,
+            "window_steps": steps, "step_hours": step_hours,
+            "scaling": {"log1p": ["v21_co_total", "v10_minutes_on_battery_30d"], "mean": [50.0] * len(names),
+                        "std": [10.0] * len(names), "clip": 8.0},
+            "threshold": 0.5, "calibration": {"x": [0.0, 0.5, 1.0], "y": [0.0, 0.4, 1.0]},
+            "component_classes": COMPONENTS, "metrics": {"test_pr_auc": 0.5, "lightgbm_failures_caught": "1 / 2"},
+            "trained_utc": "2026-10-12T00:00:00", "data_until_utc": "2026-10-06 18:00:00", "model_version": "dl-test-1"}
+    (folder / "dl_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return meta

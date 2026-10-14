@@ -139,7 +139,7 @@ Protection uses the factory auto-reclose map R-R-L: trip → 10 s → reclose �
 | source | `SIMULATED` (placed along feeders in the recloser's area) or `GPS` (loaded with `set-locations --csv`) |
 
 ### ar_ml_prediction_15min: ML failure risk per recloser per 15 min
-Filled only when a model trained in Google Colab is installed in `models/` (see `docs/ML_COLAB_GUIDE.md`).
+Filled only while ML is switched on (`config.yaml` `ml: enabled: true`; it is off for now) and a model trained in Google Colab is installed in `models/` (see `docs/ML_COLAB_GUIDE.md`).
 
 | column | description |
 |---|---|
@@ -149,6 +149,20 @@ Filled only when a model trained in Google Colab is installed in `models/` (see 
 | ml_healthy | p_fail_30d below the model's alarm level |
 | top_component, top_component_p | most likely failing part and its probability (component model) |
 | model_version | model that produced the row (e.g. `lgbm-20261007-1030`) |
+| computed_at | when the row was calculated |
+
+### ar_dl_prediction_15min: deep-learning failure risk per recloser per 15 min
+Filled only while ML is switched on (`ml: enabled: true`) and a network trained with `notebooks/AR_DL_Colab.ipynb` is installed in `models/dl/` (see the
+deep-learning section of `docs/ML_COLAB_GUIDE.md`). It is separate from the LightGBM table above; both can be filled.
+
+| column | description |
+|---|---|
+| asset_id, ts | PK |
+| p_fail_30d | calibrated probability of a failure within 30 days (0–1), from the last 14 days of V1–V42 |
+| dl_risk_class | `LOW` (< half the alarm level), `ELEVATED`, `HIGH` (≥ alarm level) |
+| dl_healthy | p_fail_30d below the network's alarm level |
+| top_component, top_component_p | most likely failing part and its probability (the network's "which part" head) |
+| model_version | network that produced the row (e.g. `dl-gru-20261012-1030`) |
 | computed_at | when the row was calculated |
 
 ### ar_daily_summary: daily HI (and ML) per recloser per local day (Asia/Colombo)

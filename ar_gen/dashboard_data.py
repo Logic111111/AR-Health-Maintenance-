@@ -279,7 +279,14 @@ def daily_summary_frame(engine: sa.Engine, days: int = 30) -> pd.DataFrame:
 
 
 def ml_history(engine: sa.Engine, asset_id: str, days: int = 30, tz: str = "Asia/Colombo") -> pd.DataFrame:
-    p = schema.ar_ml_prediction_15min
+    return _prediction_history(engine, schema.ar_ml_prediction_15min, asset_id, days, tz)
+
+
+def dl_history(engine: sa.Engine, asset_id: str, days: int = 30, tz: str = "Asia/Colombo") -> pd.DataFrame:
+    return _prediction_history(engine, schema.ar_dl_prediction_15min, asset_id, days, tz)
+
+
+def _prediction_history(engine: sa.Engine, p: sa.Table, asset_id: str, days: int, tz: str) -> pd.DataFrame:
     with engine.connect() as conn:
         last = conn.execute(sa.select(sa.func.max(p.c.ts)).where(p.c.asset_id == asset_id)).scalar()
         if last is None:
@@ -327,3 +334,55 @@ def model_status(cfg: dict) -> dict:
                 "data_until": meta.get("data_until_utc")}
     except Exception as exc:                             # noqa: BLE001 - shown in the UI
         return {"installed": False, "folder": str(folder), "error": str(exc)}
+
+
+# ------------------------------------------------------------------ deep-learning model (models/dl)
+def dl_model_status(cfg: dict) -> dict:
+    """Installed deep-learning model info, after the same checks the pipeline makes (without loading it)."""
+    from pathlib import Path
+
+    from .dl_scoring import read_dl_meta
+    folder = Path(cfg["paths"]["dl_models_dir"])
+    try:
+        meta = read_dl_meta(folder)
+        if meta is None:
+            return {"installed": False, "folder": str(folder)}
+        return {"installed": True, "folder": str(folder), "version": str(meta.get("model_version", "unknown")),
+                "arch": str(meta.get("arch", "?")), "threshold": float(meta["threshold"]),
+                "window": f"{meta['window_steps']} steps x {meta['step_hours']} h",
+                "metrics": meta.get("metrics") or {}, "trained": meta.get("trained_utc"),
+                "data_until": meta.get("data_until_utc")}
+    except Exception as exc:                             # noqa: BLE001 - shown in the UI
+        return {"installed": False, "folder": str(folder), "error": str(exc)}
+
+
+DL_COLUMNS = ["dl_p", "dl_class", "dl_healthy", "dl_component"]
+
+
+def dl_snapshot(engine: sa.Engine) -> pd.DataFrame:
+    """Newest deep-learning prediction of every recloser (one index seek per recloser)."""
+    am, p = schema.asset_master, schema.ar_dl_prediction_15min
+    cols = ["ts", "p_fail_30d", "dl_risk_class", "dl_healthy", "top_component"]
+    with engine.connect() as conn:
+        ids = list(conn.execute(sa.select(am.c.asset_id).order_by(am.c.asset_id)).scalars())
+        rows = [{"asset_id": aid, **_latest_row(conn, p, aid, cols)} for aid in ids]
+    out = pd.DataFrame(rows, columns=["asset_id", *cols]).rename(columns={
+        "ts": "dl_ts", "p_fail_30d": "dl_p", "dl_risk_class": "dl_class", "top_component": "dl_component"})
+    out["dl_p"] = pd.to_numeric(out["dl_p"], errors="coerce")
+    return out
+
+
+def with_dl(snapshot: pd.DataFrame, dl: pd.DataFrame, interval_minutes: int = 15) -> pd.DataFrame:
+    """fleet_snapshot rows + their newest deep-learning values.
+
+    Values more than one interval behind the HI (model removed or broken, scoring failed) are not shown
+    as current: dl_stale marks them and they are blanked.
+    """
+    out = snapshot.merge(dl, on="asset_id", how="left")
+    lag = pd.to_datetime(out["hi_ts"]) - pd.to_datetime(out["dl_ts"])
+    out["dl_stale"] = (lag > pd.Timedelta(minutes=int(interval_minutes))).fillna(False).astype(bool)
+    if out["dl_stale"].any():
+        out[DL_COLUMNS] = out[DL_COLUMNS].astype(object)
+        out.loc[out["dl_stale"], DL_COLUMNS] = None
+    out["dl_p"] = pd.to_numeric(out["dl_p"], errors="coerce")
+    return out

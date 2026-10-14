@@ -3,7 +3,8 @@
 Environment variables (cloud friendly):
     DATABASE_URL   SQLAlchemy URL, e.g. mysql+pymysql://user:pw@host:3306/ar_maintenance
     AR_CONFIG      path to the YAML file (default: <project>/config.yaml)
-    AR_STATE_DIR / AR_OUTPUT_DIR / AR_LOG_DIR   directory overrides
+    AR_STATE_DIR / AR_OUTPUT_DIR / AR_LOG_DIR / AR_MODELS_DIR / AR_DL_MODELS_DIR   directory overrides
+    AR_ML_ENABLED  1 / 0: overrides config.yaml ml.enabled
 """
 from __future__ import annotations
 
@@ -18,9 +19,9 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 
-_NOT_HASHED = ("paths", "db", "health_index", "variables", "default_backfill_days")
+_NOT_HASHED = ("paths", "db", "health_index", "variables", "default_backfill_days", "ml")
 _PATH_ENV = {"state_dir": "AR_STATE_DIR", "output_dir": "AR_OUTPUT_DIR", "log_dir": "AR_LOG_DIR",
-             "models_dir": "AR_MODELS_DIR"}
+             "models_dir": "AR_MODELS_DIR", "dl_models_dir": "AR_DL_MODELS_DIR"}
 
 
 def _deep_merge(base: dict, extra: dict) -> dict:
@@ -83,4 +84,13 @@ def load_config(path: str | os.PathLike | None = None,
         env_name = _PATH_ENV.get(key)
         paths[key] = _resolve(os.environ.get(env_name) or default) if env_name else _resolve(default)
     cfg["paths"] = paths
+    cfg["ml"] = dict(cfg.get("ml") or {})
+    env_ml = (os.environ.get("AR_ML_ENABLED") or "").strip().lower()
+    if env_ml:
+        cfg["ml"]["enabled"] = env_ml in ("1", "true", "yes", "on")
     return cfg
+
+
+def ml_enabled(cfg: dict) -> bool:
+    """The ML switch (config.yaml ml.enabled): LightGBM + deep-learning scoring and every ML part of the UI."""
+    return bool((cfg.get("ml") or {}).get("enabled", False))

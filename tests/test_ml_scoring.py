@@ -15,6 +15,8 @@ from ar_gen.sim.timeutil import DAY_MS
 from tests.ml_helpers import synthetic_variables, write_tiny_bundle
 from tests.test_maintenance_done import db  # noqa: F401  (shared pipeline-database fixture)
 
+pytestmark = pytest.mark.usefixtures("ml_on")       # these tests use the ML models
+
 
 def test_feature_recipe_matches_the_database_columns():
     assert V_FEATURES == [c for c in V_COLUMNS if c != "v42_weather"]
