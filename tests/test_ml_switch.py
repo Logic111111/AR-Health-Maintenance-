@@ -28,13 +28,16 @@ def _prediction_rows(cfg):
         return count(schema.ar_ml_prediction_15min), count(schema.ar_dl_prediction_15min), daily
 
 
-def test_ml_is_off_as_shipped_and_the_switch_does_not_touch_the_simulation(monkeypatch):
+def test_ml_is_on_as_shipped_and_the_switch_does_not_touch_the_simulation(monkeypatch):
     monkeypatch.delenv("AR_ML_ENABLED", raising=False)
-    off = load_config(load_dotenv_file=False)
-    assert off["ml"]["enabled"] is False and not ml_enabled(off)
-    monkeypatch.setenv("AR_ML_ENABLED", "1")
     on = load_config(load_dotenv_file=False)
-    assert ml_enabled(on) and on["config_hash"] == off["config_hash"]     # the saved simulator state stays valid
+    assert on["ml"]["enabled"] is True and ml_enabled(on)
+    monkeypatch.setenv("AR_ML_ENABLED", "0")
+    off = load_config(load_dotenv_file=False)
+    assert not ml_enabled(off) and on["config_hash"] == off["config_hash"]     # the saved simulator state stays valid
+    monkeypatch.setenv("AR_ML_ENABLED", "1")
+    on2 = load_config(load_dotenv_file=False)
+    assert ml_enabled(on2) and on2["config_hash"] == off["config_hash"]
 
 
 def test_with_ml_off_the_pipeline_scores_nothing_even_with_models_installed(db):

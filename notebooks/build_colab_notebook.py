@@ -87,6 +87,13 @@ def safe_ap(y, s):
 def safe_auc(y, s):
     return roc_auc_score(y, s) if 0 < np.sum(y) < len(y) else float("nan")
 
+def error_metrics(y, p):
+    # Probability error vs the 0/1 outcome. MAPE divides by the actual value, so it uses the failure rows only.
+    y, p = np.asarray(y, dtype=float), np.asarray(p, dtype=float)
+    pos = y == 1
+    return {"RMSE": round(float(np.sqrt(np.mean((p - y) ** 2))), 4), "MAE": round(float(np.mean(np.abs(p - y))), 4),
+            "MAPE %": round(float(100 * np.mean(np.abs(y[pos] - p[pos]) / y[pos])), 1) if pos.any() else float("nan")}
+
 usable = (~df["censored_30d"] & ~df["failed_now"]).to_numpy()
 t_first, t_last = df.loc[usable, "ts"].min(), df.loc[usable, "ts"].max()
 GAP = pd.Timedelta(days=HORIZON_DAYS)
@@ -404,6 +411,9 @@ def _cells() -> list:
     * **ROC-AUC / PR-AUC:** how well risky rows are ranked above safe ones (PR-AUC is the stricter one for rare events).
     * **Failures caught:** a warning appeared in the 30 days before the failure.
     * **Warning days:** how early the first warning came.
+    * **RMSE / MAE / MAPE:** how far the predicted probability is from what happened (1 = failed within 30 days,
+      0 = did not), for the probability models; lower is better. MAPE divides by the actual value, so it is
+      computed on the failure rows (actual = 1) only.
 
     The HI's own rule is **HI < 60**. "ML or HI" warns when either one does.
     """)
@@ -430,6 +440,9 @@ def _cells() -> list:
     print(f"random-guess PR-AUC = {test['failure_next_30d'].mean():.3f} | "
           f"Brier score (lower = better) = {brier_score_loss(test['failure_next_30d'], test['p']):.4f}")
     display(comparison)
+    errors = pd.DataFrame({"ML model": error_metrics(test["failure_next_30d"], test["p"])}).T
+    errors.index.name = "probability error (test)"
+    display(errors)
     by_comp = pd.DataFrame({name: per.groupby("component")["caught"].agg(lambda s: f"{int(s.sum())} / {len(s)}")
                             for name, per in per_failure.items()})
     by_comp.index.name = "failures caught by component"
@@ -568,7 +581,9 @@ def _cells() -> list:
     if comp_model is not None:
         comp_model.save_model("export/model_component.txt")
     ml_res, hi_res = per_failure["ML model"], per_failure["Health Index (HI < 60)"]
+    err = errors.loc["ML model"]
     metrics = {"test_roc_auc": results["ML model"]["ROC-AUC"], "test_pr_auc": results["ML model"]["PR-AUC"],
+               "test_rmse": err["RMSE"], "test_mae": err["MAE"], "test_mape_pct": err["MAPE %"],
                "test_failures_caught": results["ML model"]["failures caught"],
                "test_median_warning_days": results["ML model"]["median warning days"],
                "test_false_alarm_days_per_ar_month": results["ML model"]["false-alarm days per AR-month"],

@@ -53,9 +53,16 @@ def build_service_package(out_dir: Path | None = None) -> Path:
     missing = [f for f in package_files() + [README_SRC] if not (ROOT / f).is_file()]
     if missing:
         raise FileNotFoundError(f"cannot build the service package, missing: {', '.join(missing)}")
+    import re
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         for rel in package_files():
-            z.write(ROOT / rel, f"{PACKAGE_NAME}/{rel}")
+            if rel == "config.yaml":
+                cfg_text = (ROOT / rel).read_text(encoding="utf-8")
+                # The service package excludes ML modules; enforce enabled: false in the packaged config.yaml
+                cfg_text = re.sub(r"(ml:\s*\n\s*enabled:\s*)true", r"\g<1>false", cfg_text)
+                z.writestr(f"{PACKAGE_NAME}/{rel}", cfg_text)
+            else:
+                z.write(ROOT / rel, f"{PACKAGE_NAME}/{rel}")
         z.writestr(f"{PACKAGE_NAME}/README.md", (ROOT / README_SRC).read_text(encoding="utf-8"))
         z.writestr(f"{PACKAGE_NAME}/requirements-service.txt", REQUIREMENTS)
     return path

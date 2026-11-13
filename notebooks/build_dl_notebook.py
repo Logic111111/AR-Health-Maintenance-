@@ -429,6 +429,9 @@ def _cells() -> list:
     * **Failures caught:** a warning appeared in the 30 days before the failure.
     * **Warning days:** how early the first warning came.
     * **"DL or …":** warns when either one does. It shows what you gain by using both.
+    * **RMSE / MAE / MAPE:** how far the predicted probability is from what happened (1 = failed within 30 days,
+      0 = did not), for the probability models; lower is better. MAPE divides by the actual value, so it is
+      computed on the failure rows (actual = 1) only.
     """)
     code("""
     test = df.loc[test_mask, ["asset_id", "ts", "health_index", "failure_next_30d", "next_failure_component"]].copy()
@@ -496,6 +499,10 @@ def _cells() -> list:
     print(f"random-guess PR-AUC = {test['failure_next_30d'].mean():.3f} | "
           f"Brier score of the network (lower = better) = {brier_score_loss(test['failure_next_30d'], test['p']):.4f}")
     display(comparison)
+    errors = pd.DataFrame({name: error_metrics(test["failure_next_30d"], test[col])
+                           for name, col in [(DL, "p")] + ([("LightGBM", "p_lgbm")] if LGBM else [])}).T
+    errors.index.name = "probability error (test)"
+    display(errors)
     by_comp = pd.DataFrame({name: per.groupby("component")["caught"].agg(lambda s: f"{int(s.sum())} / {len(s)}")
                             for name, per in per_failure.items()})
     by_comp.index.name = "failures caught by component"
@@ -667,8 +674,9 @@ def _cells() -> list:
                   "width": HIDDEN, "steps": WINDOW_STEPS}
     torch.save({"config": NET_CONFIG, "state_dict": {k: v.cpu() for k, v in model.state_dict().items()}},
                "export_dl/model_dl.pt")
-    dl_res = results[DL]
+    dl_res, err = results[DL], errors.loc[DL]
     metrics = {"test_roc_auc": dl_res["ROC-AUC"], "test_pr_auc": dl_res["PR-AUC"],
+               "test_rmse": err["RMSE"], "test_mae": err["MAE"], "test_mape_pct": err["MAPE %"],
                "test_failures_caught": dl_res["failures caught"],
                "test_median_warning_days": dl_res["median warning days"],
                "test_false_alarm_days_per_ar_month": dl_res["false-alarm days per AR-month"],

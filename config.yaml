@@ -492,6 +492,6 @@ ground_truth_daily: true
 # Machine learning (LightGBM in models/, deep learning in models/dl)
 # ---------------------------------------------------------------------
 ml:
-  enabled: false     # false: no ML scoring in the collector and no ML in the dashboard or the ml-/dl- commands.
+  enabled: true      # false: no ML scoring in the collector and no ML in the dashboard or the ml-/dl- commands.
                      # The code, notebooks, models and stored predictions are kept; true turns it all back on.
                      # (environment variable AR_ML_ENABLED=1 / 0 overrides this)
